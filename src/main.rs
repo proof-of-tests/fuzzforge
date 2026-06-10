@@ -1,4 +1,7 @@
-use std::path::PathBuf;
+use std::{
+    io::{self, IsTerminal, Write},
+    path::PathBuf,
+};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -109,9 +112,9 @@ fn main() -> Result<()> {
             let proven_before = Store::new(&store)
                 .stats(&program_hash)
                 .with_context(|| format!("failed to load HLL record for {program_hash}"))?
-                .run_count;
-            eprintln!("proven_before={proven_before}");
-            let mut proven_total = proven_before;
+                .estimated_observations;
+            eprintln!("proven_before={proven_before:.3}");
+            let update_in_place = io::stderr().is_terminal();
             for _ in 0..count {
                 let seed = match seed.as_ref() {
                     Some(seed) => seed_from_hex(seed)
@@ -120,12 +123,15 @@ fn main() -> Result<()> {
                 };
                 let result = run_wasm(&wasm, seed, &store, config.clone())
                     .with_context(|| format!("failed to run {}", wasm.display()))?;
-                proven_total = result.run_count;
+                print_proven_added(
+                    proven_before,
+                    result.estimated_observations,
+                    update_in_place,
+                )?;
             }
-            eprintln!(
-                "proven_added={}",
-                proven_total.saturating_sub(proven_before)
-            );
+            if update_in_place {
+                eprintln!();
+            }
         }
         Command::Stats {
             wasm_or_hash,
@@ -141,7 +147,6 @@ fn main() -> Result<()> {
             println!("schema_version={}", stats.schema_version);
             println!("precision={}", stats.precision);
             println!("buckets={}", stats.buckets);
-            println!("runs={}", stats.run_count);
             println!("stored_observations={}", stats.stored_observations);
             println!("estimated_observations={:.3}", stats.estimated_observations);
             println!(
@@ -153,9 +158,8 @@ fn main() -> Result<()> {
             let store = Store::new(store);
             for stats in store.list().context("failed to list HLL records")? {
                 println!(
-                    "{} runs={} estimate={:.3} precision={} buckets={}",
+                    "{} estimate={:.3} precision={} buckets={}",
                     stats.program_hash,
-                    stats.run_count,
                     stats.estimated_observations,
                     stats.precision,
                     stats.buckets
@@ -193,4 +197,19 @@ fn resolve_program_hash(value: &str) -> Result<String> {
         return Ok(value.to_ascii_lowercase());
     }
     anyhow::bail!("expected an existing WASM path or a 64-character BLAKE3 hash")
+}
+
+fn print_proven_added(
+    proven_before: f64,
+    estimated_observations: f64,
+    update_in_place: bool,
+) -> Result<()> {
+    let proven_added = (estimated_observations - proven_before).max(0.0);
+    let mut stderr = io::stderr().lock();
+    if update_in_place {
+        write!(stderr, "\rproven_added={proven_added:.3}")?;
+    } else {
+        writeln!(stderr, "proven_added={proven_added:.3}")?;
+    }
+    stderr.flush().context("failed to flush progress output")
 }

@@ -159,9 +159,9 @@ impl HllRecord {
         observation.validate(&self.program_hash)?;
         let value = observation_hash_to_u64(&observation.observation_hash)?;
         self.sketch.insert_hash(value);
-        self.run_count = self.run_count.saturating_add(1);
         self.last_observation_hash = Some(observation.observation_hash.clone());
         self.observations.push(observation);
+        self.run_count = self.observations.len() as u64;
         Ok(())
     }
 
@@ -189,13 +189,6 @@ impl HllRecord {
             );
         }
         self.sketch.validate()?;
-        if self.run_count as usize != self.observations.len() {
-            bail!(
-                "HLL run count {} does not match stored observation count {}",
-                self.run_count,
-                self.observations.len()
-            );
-        }
         for observation in &self.observations {
             observation.validate(&self.program_hash)?;
         }
@@ -540,8 +533,7 @@ pub fn verify_wasm_bytes(wasm: &[u8], record: &HllRecord) -> Result<VerifyReport
         }
     }
     let sketch_matches = rebuilt.sketch.registers == record.sketch.registers
-        && rebuilt.last_observation_hash == record.last_observation_hash
-        && rebuilt.run_count == record.run_count;
+        && rebuilt.last_observation_hash == record.last_observation_hash;
     if !sketch_matches {
         failures.push(VerifyFailure {
             seed_hex: "-".to_owned(),
@@ -1061,6 +1053,22 @@ mod tests {
             .load_or_new(&result.program_hash)
             .unwrap();
         assert_eq!(record.observations[0].seed_hex, result.seed_hex);
+        let report = verify_wasm_bytes(&wasm, &record).unwrap();
+        assert!(report.is_success());
+        assert_eq!(report.checked_observations, 1);
+    }
+
+    #[test]
+    fn verify_ignores_untrusted_run_counter() {
+        let wasm = wat_bytes(r#"(module (func (export "_start")))"#);
+        let store = tempdir().expect("tempdir");
+        let result =
+            run_wasm_bytes(&wasm, b"seed".to_vec(), store.path(), RunConfig::default()).unwrap();
+        let mut record = Store::new(store.path())
+            .load_or_new(&result.program_hash)
+            .unwrap();
+        record.run_count = 999;
+
         let report = verify_wasm_bytes(&wasm, &record).unwrap();
         assert!(report.is_success());
         assert_eq!(report.checked_observations, 1);
