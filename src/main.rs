@@ -6,8 +6,8 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use fuzzforge::{
-    DEFAULT_FUEL, DEFAULT_MEMORY_BYTES, DEFAULT_SEED_BYTES, HLL_BUCKETS, HLL_PRECISION, RunConfig,
-    Store, generate_seed, hash_wasm_file, run_wasm, seed_from_hex, verify_wasm,
+    DEFAULT_FUEL, DEFAULT_MEMORY_BYTES, DEFAULT_SEED_BYTES, RunConfig, Store, generate_seed,
+    hash_wasm_file, run_wasm, seed_from_hex, verify_wasm,
 };
 
 const DEFAULT_RUN_COUNT: usize = 1;
@@ -112,7 +112,15 @@ fn main() -> Result<()> {
                 memory_bytes,
                 invoke,
             };
-            for run_index in 1..=count {
+            let program_hash = hash_wasm_file(&wasm)
+                .with_context(|| format!("failed to hash {}", wasm.display()))?;
+            let proven_before = Store::new(&store)
+                .stats(&program_hash)
+                .with_context(|| format!("failed to load HLL record for {program_hash}"))?
+                .run_count;
+            eprintln!("proven_before={proven_before}");
+            let mut proven_total = proven_before;
+            for _ in 0..count {
                 let seed = match seed.as_ref() {
                     Some(seed) => seed_from_hex(seed)
                         .with_context(|| format!("failed to parse seed `{seed}`"))?,
@@ -125,17 +133,12 @@ fn main() -> Result<()> {
                         .write_all(&result.stdout)
                         .context("failed to write guest stdout")?;
                 }
-                eprintln!("run_index={run_index}");
-                eprintln!("run_count={count}");
-                eprintln!("program_hash={}", result.program_hash);
-                eprintln!("seed={}", result.seed_hex);
-                eprintln!("status={}", result.status);
-                eprintln!("fuel_consumed={}", result.fuel_consumed);
-                eprintln!("hll_precision={HLL_PRECISION}");
-                eprintln!("hll_buckets={HLL_BUCKETS}");
-                eprintln!("hll_runs={}", result.run_count);
-                eprintln!("hll_estimate={:.3}", result.estimated_observations);
+                proven_total = result.run_count;
             }
+            eprintln!(
+                "proven_added={}",
+                proven_total.saturating_sub(proven_before)
+            );
         }
         Command::Stats {
             wasm_or_hash,

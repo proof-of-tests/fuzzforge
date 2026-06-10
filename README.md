@@ -15,11 +15,12 @@ cargo run -- list
 ```
 
 The `run` command sends a seed to the guest as stdin. If `--seed <hex>` is not
-provided, fuzzforge generates a random seed and prints it to stderr with the run
-metadata. Use `--count <n>` to execute multiple runs with different generated
-seeds. `--seed` is accepted only when `--count=1`. Captured guest stdout is
-forwarded to process stdout by default. Use `--no-stdout` to suppress stdout
-forwarding.
+provided, fuzzforge generates random seeds and stores them with each observation.
+Use `--count <n>` to execute multiple runs with different generated seeds.
+`--seed` is accepted only when `--count=1`. Captured guest stdout is forwarded
+to process stdout by default. Use `--no-stdout` to suppress stdout forwarding.
+The command prints only the previous proven run count and the newly proven count
+for this invocation to stderr.
 
 ## Example WASI Program
 

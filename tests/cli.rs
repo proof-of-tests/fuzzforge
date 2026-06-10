@@ -45,9 +45,7 @@ fn run_stats_and_list_persist_hll() {
         .expect("run command");
     assert!(run.status.success(), "stderr: {}", stderr(&run));
     assert_eq!(run.stdout, b"hello cli");
-    assert!(stderr(&run).contains("hll_precision=6"));
-    assert!(stderr(&run).contains("hll_buckets=64"));
-    assert!(stderr(&run).contains("seed=68656c6c6f20636c69"));
+    assert_eq!(stderr(&run), "proven_before=0\nproven_added=1\n");
 
     let stats = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
         .args([
@@ -96,7 +94,7 @@ fn repeated_runs_increment_run_count_without_stdout_forwarding() {
     let store_path = temp.path().join("store");
     fs::write(&wasm_path, echo_wasm()).expect("write wasm");
 
-    for _ in 0..2 {
+    for expected_before in [0, 1] {
         let output = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
             .args([
                 "run",
@@ -111,6 +109,10 @@ fn repeated_runs_increment_run_count_without_stdout_forwarding() {
             .expect("run command");
         assert!(output.status.success(), "stderr: {}", stderr(&output));
         assert!(output.stdout.is_empty());
+        assert_eq!(
+            stderr(&output),
+            format!("proven_before={expected_before}\nproven_added=1\n")
+        );
     }
 
     let stats = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
@@ -147,15 +149,7 @@ fn count_runs_multiple_generated_seeds_and_verifies() {
     assert!(run.status.success(), "stderr: {}", stderr(&run));
     assert!(run.stdout.is_empty());
 
-    let run_stderr = stderr(&run);
-    assert!(run_stderr.contains("run_index=1"));
-    assert!(run_stderr.contains("run_index=2"));
-    let seeds: Vec<&str> = run_stderr
-        .lines()
-        .filter_map(|line| line.strip_prefix("seed="))
-        .collect();
-    assert_eq!(seeds.len(), 2);
-    assert_ne!(seeds[0], seeds[1]);
+    assert_eq!(stderr(&run), "proven_before=0\nproven_added=2\n");
 
     let stats = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
         .args([
