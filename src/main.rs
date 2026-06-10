@@ -54,8 +54,12 @@ enum Command {
         #[arg(long)]
         invoke: Option<String>,
 
-        /// Do not forward captured guest stdout to process stdout.
+        /// Forward captured guest stdout to process stdout.
         #[arg(long)]
+        stdout: bool,
+
+        /// Deprecated no-op. Guest stdout is suppressed by default.
+        #[arg(long, hide = true)]
         no_stdout: bool,
     },
 
@@ -99,7 +103,8 @@ fn main() -> Result<()> {
             fuel,
             memory_bytes,
             invoke,
-            no_stdout,
+            stdout,
+            no_stdout: _,
         } => {
             if count == 0 {
                 anyhow::bail!("--count must be greater than zero");
@@ -128,7 +133,7 @@ fn main() -> Result<()> {
                 };
                 let result = run_wasm(&wasm, seed, &store, config.clone())
                     .with_context(|| format!("failed to run {}", wasm.display()))?;
-                if !no_stdout {
+                if stdout {
                     io::stdout()
                         .write_all(&result.stdout)
                         .context("failed to write guest stdout")?;

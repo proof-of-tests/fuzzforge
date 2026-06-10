@@ -44,7 +44,7 @@ fn run_stats_and_list_persist_hll() {
         .output()
         .expect("run command");
     assert!(run.status.success(), "stderr: {}", stderr(&run));
-    assert_eq!(run.stdout, b"hello cli");
+    assert!(run.stdout.is_empty());
     assert_eq!(stderr(&run), "proven_before=0\nproven_added=1\n");
 
     let stats = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
@@ -85,6 +85,30 @@ fn run_stats_and_list_persist_hll() {
     assert!(verify.status.success(), "stderr: {}", stderr(&verify));
     assert!(stdout(&verify).contains("verification=ok"));
     assert!(stdout(&verify).contains("checked_observations=1"));
+}
+
+#[test]
+fn run_stdout_flag_forwards_guest_stdout() {
+    let temp = tempdir().expect("tempdir");
+    let wasm_path = temp.path().join("echo.wasm");
+    let store_path = temp.path().join("store");
+    fs::write(&wasm_path, echo_wasm()).expect("write wasm");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
+        .args([
+            "run",
+            wasm_path.to_str().unwrap(),
+            "--seed",
+            "68656c6c6f207374646f7574",
+            "--store",
+            store_path.to_str().unwrap(),
+            "--stdout",
+        ])
+        .output()
+        .expect("run command");
+    assert!(run.status.success(), "stderr: {}", stderr(&run));
+    assert_eq!(run.stdout, b"hello stdout");
+    assert_eq!(stderr(&run), "proven_before=0\nproven_added=1\n");
 }
 
 #[test]
@@ -142,7 +166,6 @@ fn count_runs_multiple_generated_seeds_and_verifies() {
             "--store",
             store_path.to_str().unwrap(),
             "--count=2",
-            "--no-stdout",
         ])
         .output()
         .expect("run command");
