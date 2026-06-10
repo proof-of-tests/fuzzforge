@@ -12,9 +12,10 @@ use wasmi::{
 
 pub const HLL_PRECISION: u8 = 6;
 pub const HLL_BUCKETS: usize = 1 << HLL_PRECISION;
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 pub const DEFAULT_FUEL: u64 = 10_000_000;
 pub const DEFAULT_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+pub const DEFAULT_SEED_BYTES: usize = 32;
 const DEFAULT_TABLE_ELEMENTS: usize = 10_000;
 
 const WASI_MODULE: &str = "wasi_snapshot_preview1";
@@ -29,7 +30,7 @@ const RIGHTS_FD_READ: u64 = 1 << 1;
 const RIGHTS_FD_FDSTAT_SET_FLAGS: u64 = 1 << 3;
 const RIGHTS_FD_WRITE: u64 = 1 << 6;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunConfig {
     pub fuel: u64,
     pub memory_bytes: usize,
@@ -66,16 +67,17 @@ impl fmt::Display for RunStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Observation {
     pub program_hash: String,
-    pub stdin_hash: String,
+    pub seed_hex: String,
     pub stdout_hash: String,
     pub status: RunStatus,
     pub fuel_consumed: u64,
+    pub config: RunConfig,
 }
 
 #[derive(Debug, Clone)]
 pub struct RunResult {
     pub program_hash: String,
-    pub stdin_hash: String,
+    pub seed_hex: String,
     pub stdout_hash: String,
     pub status: RunStatus,
     pub fuel_consumed: u64,
@@ -86,6 +88,16 @@ pub struct RunResult {
     pub estimated_observations: f64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredObservation {
+    pub seed_hex: String,
+    pub stdout_hash: String,
+    pub status: RunStatus,
+    pub fuel_consumed: u64,
+    pub config: RunConfig,
+    pub observation_hash: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct HllStats {
     pub schema_version: u32,
@@ -93,8 +105,29 @@ pub struct HllStats {
     pub precision: u8,
     pub buckets: usize,
     pub run_count: u64,
+    pub stored_observations: usize,
     pub last_observation_hash: Option<String>,
     pub estimated_observations: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyFailure {
+    pub seed_hex: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyReport {
+    pub program_hash: String,
+    pub checked_observations: usize,
+    pub sketch_matches: bool,
+    pub failures: Vec<VerifyFailure>,
+}
+
+impl VerifyReport {
+    pub fn is_success(&self) -> bool {
+        self.sketch_matches && self.failures.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +138,7 @@ pub struct HllRecord {
     pub run_count: u64,
     pub last_observation_hash: Option<String>,
     pub sketch: Sketch,
+    pub observations: Vec<StoredObservation>,
 }
 
 impl HllRecord {
@@ -116,15 +150,18 @@ impl HllRecord {
             run_count: 0,
             last_observation_hash: None,
             sketch: Sketch::new(),
+            observations: Vec::new(),
         }
     }
 
-    pub fn insert_observation(&mut self, observation_hash: &str) -> Result<()> {
+    pub fn insert_observation(&mut self, observation: StoredObservation) -> Result<()> {
         self.validate()?;
-        let value = observation_hash_to_u64(observation_hash)?;
+        observation.validate(&self.program_hash)?;
+        let value = observation_hash_to_u64(&observation.observation_hash)?;
         self.sketch.insert_hash(value);
         self.run_count = self.run_count.saturating_add(1);
-        self.last_observation_hash = Some(observation_hash.to_owned());
+        self.last_observation_hash = Some(observation.observation_hash.clone());
+        self.observations.push(observation);
         Ok(())
     }
 
@@ -135,6 +172,7 @@ impl HllRecord {
             precision: self.precision,
             buckets: 1usize << self.precision,
             run_count: self.run_count,
+            stored_observations: self.observations.len(),
             last_observation_hash: self.last_observation_hash.clone(),
             estimated_observations: self.sketch.estimate(),
         }
@@ -151,6 +189,55 @@ impl HllRecord {
             );
         }
         self.sketch.validate()?;
+        if self.run_count as usize != self.observations.len() {
+            bail!(
+                "HLL run count {} does not match stored observation count {}",
+                self.run_count,
+                self.observations.len()
+            );
+        }
+        for observation in &self.observations {
+            observation.validate(&self.program_hash)?;
+        }
+        Ok(())
+    }
+}
+
+impl StoredObservation {
+    pub fn from_observation(observation: Observation) -> Self {
+        let observation_hash = observation_hash(&observation);
+        Self {
+            seed_hex: observation.seed_hex,
+            stdout_hash: observation.stdout_hash,
+            status: observation.status,
+            fuel_consumed: observation.fuel_consumed,
+            config: observation.config,
+            observation_hash,
+        }
+    }
+
+    fn to_observation(&self, program_hash: &str) -> Observation {
+        Observation {
+            program_hash: program_hash.to_owned(),
+            seed_hex: self.seed_hex.clone(),
+            stdout_hash: self.stdout_hash.clone(),
+            status: self.status.clone(),
+            fuel_consumed: self.fuel_consumed,
+            config: self.config.clone(),
+        }
+    }
+
+    fn validate(&self, program_hash: &str) -> Result<()> {
+        seed_from_hex(&self.seed_hex)?;
+        let expected = observation_hash(&self.to_observation(program_hash));
+        if self.observation_hash != expected {
+            bail!(
+                "stored observation hash mismatch for seed {}: expected {}, got {}",
+                self.seed_hex,
+                expected,
+                self.observation_hash
+            );
+        }
         Ok(())
     }
 }
@@ -264,9 +351,9 @@ impl Store {
         Ok(())
     }
 
-    pub fn update(&self, program_hash: &str, observation_hash: &str) -> Result<HllStats> {
+    pub fn update(&self, program_hash: &str, observation: StoredObservation) -> Result<HllStats> {
         let mut record = self.load_or_new(program_hash)?;
-        record.insert_observation(observation_hash)?;
+        record.insert_observation(observation)?;
         let stats = record.stats();
         self.save(&record)?;
         Ok(stats)
@@ -318,49 +405,86 @@ pub fn hash_wasm_file(path: &Path) -> Result<String> {
     Ok(hash_bytes_hex(&bytes))
 }
 
+pub fn generate_seed(seed_bytes: usize) -> Result<Vec<u8>> {
+    if seed_bytes == 0 {
+        bail!("seed byte length must be greater than zero");
+    }
+    let mut seed = vec![0; seed_bytes];
+    getrandom::fill(&mut seed)
+        .map_err(|error| anyhow::anyhow!("failed to generate random seed: {error}"))?;
+    Ok(seed)
+}
+
+pub fn seed_to_hex(seed: &[u8]) -> String {
+    bytes_to_hex(seed)
+}
+
+pub fn seed_from_hex(seed_hex: &str) -> Result<Vec<u8>> {
+    if seed_hex.is_empty() {
+        bail!("seed must not be empty");
+    }
+    hex_to_bytes(seed_hex)
+}
+
 pub fn observation_hash(observation: &Observation) -> String {
     let mut hasher = blake3::Hasher::new();
     update_hash_field(&mut hasher, observation.program_hash.as_bytes());
-    update_hash_field(&mut hasher, observation.stdin_hash.as_bytes());
+    update_hash_field(&mut hasher, observation.seed_hex.as_bytes());
     update_hash_field(&mut hasher, observation.stdout_hash.as_bytes());
     update_hash_field(&mut hasher, observation.status.to_string().as_bytes());
     update_hash_field(&mut hasher, &observation.fuel_consumed.to_le_bytes());
+    update_hash_field(&mut hasher, &observation.config.fuel.to_le_bytes());
+    update_hash_field(&mut hasher, &observation.config.memory_bytes.to_le_bytes());
+    update_hash_field(
+        &mut hasher,
+        observation
+            .config
+            .invoke
+            .as_deref()
+            .unwrap_or("")
+            .as_bytes(),
+    );
     hasher.finalize().to_hex().to_string()
 }
 
 pub fn run_wasm(
     wasm_path: &Path,
-    stdin: Vec<u8>,
+    seed: Vec<u8>,
     store_path: &Path,
     config: RunConfig,
 ) -> Result<RunResult> {
     let wasm = fs::read(wasm_path)
         .with_context(|| format!("failed to read WASM module {}", wasm_path.display()))?;
-    run_wasm_bytes(&wasm, stdin, store_path, config)
+    run_wasm_bytes(&wasm, seed, store_path, config)
 }
 
 pub fn run_wasm_bytes(
     wasm: &[u8],
-    stdin: Vec<u8>,
+    seed: Vec<u8>,
     store_path: &Path,
     config: RunConfig,
 ) -> Result<RunResult> {
+    if seed.is_empty() {
+        bail!("seed must not be empty");
+    }
     let program_hash = hash_bytes_hex(wasm);
-    let stdin_hash = hash_bytes_hex(&stdin);
-    let output = execute_wasm(wasm, stdin, config)?;
+    let seed_hex = seed_to_hex(&seed);
+    let output = execute_wasm(wasm, seed, config.clone())?;
     let stdout_hash = hash_bytes_hex(&output.stdout);
     let observation = Observation {
         program_hash: program_hash.clone(),
-        stdin_hash: stdin_hash.clone(),
+        seed_hex: seed_hex.clone(),
         stdout_hash: stdout_hash.clone(),
         status: output.status.clone(),
         fuel_consumed: output.fuel_consumed,
+        config,
     };
-    let observation_hash = observation_hash(&observation);
-    let stats = Store::new(store_path).update(&program_hash, &observation_hash)?;
+    let stored_observation = StoredObservation::from_observation(observation);
+    let observation_hash = stored_observation.observation_hash.clone();
+    let stats = Store::new(store_path).update(&program_hash, stored_observation)?;
     Ok(RunResult {
         program_hash,
-        stdin_hash,
+        seed_hex,
         stdout_hash,
         status: output.status,
         fuel_consumed: output.fuel_consumed,
@@ -370,6 +494,113 @@ pub fn run_wasm_bytes(
         run_count: stats.run_count,
         estimated_observations: stats.estimated_observations,
     })
+}
+
+pub fn verify_wasm(wasm_path: &Path, store_path: &Path) -> Result<VerifyReport> {
+    let wasm = fs::read(wasm_path)
+        .with_context(|| format!("failed to read WASM module {}", wasm_path.display()))?;
+    let program_hash = hash_bytes_hex(&wasm);
+    let record = Store::new(store_path).load_or_new(&program_hash)?;
+    verify_wasm_bytes(&wasm, &record)
+}
+
+pub fn verify_wasm_bytes(wasm: &[u8], record: &HllRecord) -> Result<VerifyReport> {
+    record.validate()?;
+    if record.observations.is_empty() {
+        bail!(
+            "no stored observations to verify for {}",
+            record.program_hash
+        );
+    }
+    let program_hash = hash_bytes_hex(wasm);
+    if record.program_hash != program_hash {
+        bail!(
+            "WASM hash mismatch: record is {}, input is {}",
+            record.program_hash,
+            program_hash
+        );
+    }
+
+    let mut failures = Vec::new();
+    let mut rebuilt = HllRecord::new(record.program_hash.clone());
+    for expected in &record.observations {
+        match verify_observation(wasm, &record.program_hash, expected) {
+            Ok(actual) => {
+                if let Err(error) = rebuilt.insert_observation(actual) {
+                    failures.push(VerifyFailure {
+                        seed_hex: expected.seed_hex.clone(),
+                        reason: error.to_string(),
+                    });
+                }
+            }
+            Err(error) => failures.push(VerifyFailure {
+                seed_hex: expected.seed_hex.clone(),
+                reason: error.to_string(),
+            }),
+        }
+    }
+    let sketch_matches = rebuilt.sketch.registers == record.sketch.registers
+        && rebuilt.last_observation_hash == record.last_observation_hash
+        && rebuilt.run_count == record.run_count;
+    if !sketch_matches {
+        failures.push(VerifyFailure {
+            seed_hex: "-".to_owned(),
+            reason: "rebuilt HLL sketch does not match stored sketch".to_owned(),
+        });
+    }
+    Ok(VerifyReport {
+        program_hash: record.program_hash.clone(),
+        checked_observations: record.observations.len(),
+        sketch_matches,
+        failures,
+    })
+}
+
+fn verify_observation(
+    wasm: &[u8],
+    program_hash: &str,
+    expected: &StoredObservation,
+) -> Result<StoredObservation> {
+    let seed = seed_from_hex(&expected.seed_hex)?;
+    let output = execute_wasm(wasm, seed, expected.config.clone())?;
+    let stdout_hash = hash_bytes_hex(&output.stdout);
+    if stdout_hash != expected.stdout_hash {
+        bail!(
+            "stdout hash mismatch: expected {}, got {}",
+            expected.stdout_hash,
+            stdout_hash
+        );
+    }
+    if output.status != expected.status {
+        bail!(
+            "status mismatch: expected {}, got {}",
+            expected.status,
+            output.status
+        );
+    }
+    if output.fuel_consumed != expected.fuel_consumed {
+        bail!(
+            "fuel consumed mismatch: expected {}, got {}",
+            expected.fuel_consumed,
+            output.fuel_consumed
+        );
+    }
+    let actual = StoredObservation::from_observation(Observation {
+        program_hash: program_hash.to_owned(),
+        seed_hex: expected.seed_hex.clone(),
+        stdout_hash,
+        status: output.status,
+        fuel_consumed: output.fuel_consumed,
+        config: expected.config.clone(),
+    });
+    if actual.observation_hash != expected.observation_hash {
+        bail!(
+            "observation hash mismatch: expected {}, got {}",
+            expected.observation_hash,
+            actual.observation_hash
+        );
+    }
+    Ok(actual)
 }
 
 #[derive(Debug)]
@@ -670,12 +901,57 @@ fn observation_hash_to_u64(hash: &str) -> Result<u64> {
     Ok(value)
 }
 
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn hex_to_bytes(hex: &str) -> Result<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        bail!("hex input must contain an even number of characters");
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    let raw = hex.as_bytes();
+    for pair in raw.chunks_exact(2) {
+        let high = hex_digit(pair[0])?;
+        let low = hex_digit(pair[1])?;
+        bytes.push((high << 4) | low);
+    }
+    Ok(bytes)
+}
+
+fn hex_digit(byte: u8) -> Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => bail!("invalid hex character `{}`", byte as char),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     fn wat_bytes(wat: &str) -> Vec<u8> {
         wat::parse_str(wat).expect("valid wat")
+    }
+
+    fn stored_observation(seed_hex: &str) -> StoredObservation {
+        StoredObservation::from_observation(Observation {
+            program_hash: "a".repeat(64),
+            seed_hex: seed_hex.to_owned(),
+            stdout_hash: hash_bytes_hex(seed_hex.as_bytes()),
+            status: RunStatus::Success,
+            fuel_consumed: 42,
+            config: RunConfig::default(),
+        })
     }
 
     #[test]
@@ -689,10 +965,11 @@ mod tests {
     fn observation_hash_is_stable() {
         let observation = Observation {
             program_hash: "a".repeat(64),
-            stdin_hash: "b".repeat(64),
+            seed_hex: "b".repeat(64),
             stdout_hash: "c".repeat(64),
             status: RunStatus::Success,
             fuel_consumed: 42,
+            config: RunConfig::default(),
         };
         assert_eq!(
             observation_hash(&observation),
@@ -712,28 +989,31 @@ mod tests {
     fn hll_roundtrips_through_json() {
         let mut record = HllRecord::new("a".repeat(64));
         record
-            .insert_observation(&"1".repeat(64))
+            .insert_observation(stored_observation("11"))
             .expect("insert observation");
         let json = serde_json::to_string(&record).expect("serialize");
         let restored: HllRecord = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored.schema_version, SCHEMA_VERSION);
         assert_eq!(restored.precision, HLL_PRECISION);
         assert_eq!(restored.run_count, 1);
+        assert_eq!(restored.observations.len(), 1);
         assert!(restored.stats().estimated_observations >= 1.0);
     }
 
     #[test]
     fn duplicate_hll_observation_does_not_increase_estimate() {
         let mut record = HllRecord::new("a".repeat(64));
+        let observation = stored_observation("22");
         record
-            .insert_observation(&"2".repeat(64))
+            .insert_observation(observation.clone())
             .expect("first insert");
         let first = record.stats().estimated_observations;
         record
-            .insert_observation(&"2".repeat(64))
+            .insert_observation(observation)
             .expect("second insert");
         let second = record.stats().estimated_observations;
         assert_eq!(record.run_count, 2);
+        assert_eq!(record.observations.len(), 2);
         assert_eq!(first, second);
     }
 
@@ -741,15 +1021,69 @@ mod tests {
     fn distinct_hll_observations_increase_estimate() {
         let mut record = HllRecord::new("a".repeat(64));
         record
-            .insert_observation(&"2".repeat(64))
+            .insert_observation(stored_observation("22"))
             .expect("first insert");
         let first = record.stats().estimated_observations;
         record
-            .insert_observation(&"3".repeat(64))
+            .insert_observation(stored_observation("33"))
             .expect("second insert");
         let second = record.stats().estimated_observations;
         assert_eq!(record.run_count, 2);
         assert!(second > first);
+    }
+
+    #[test]
+    fn run_stores_seed_and_verify_replays_it() {
+        let wasm = wat_bytes(
+            r#"
+            (module
+              (import "wasi_snapshot_preview1" "fd_read"
+                (func $fd_read (param i32 i32 i32 i32) (result i32)))
+              (import "wasi_snapshot_preview1" "fd_write"
+                (func $fd_write (param i32 i32 i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (func (export "_start")
+                (i32.store (i32.const 0) (i32.const 16))
+                (i32.store (i32.const 4) (i32.const 5))
+                (drop (call $fd_read
+                  (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 24)))
+                (i32.store (i32.const 8) (i32.const 16))
+                (i32.store (i32.const 12) (i32.load (i32.const 24)))
+                (drop (call $fd_write
+                  (i32.const 1) (i32.const 8) (i32.const 1) (i32.const 28)))))
+            "#,
+        );
+        let store = tempdir().expect("tempdir");
+        let result =
+            run_wasm_bytes(&wasm, b"hello".to_vec(), store.path(), RunConfig::default()).unwrap();
+        assert_eq!(result.seed_hex, "68656c6c6f");
+        let record = Store::new(store.path())
+            .load_or_new(&result.program_hash)
+            .unwrap();
+        assert_eq!(record.observations[0].seed_hex, result.seed_hex);
+        let report = verify_wasm_bytes(&wasm, &record).unwrap();
+        assert!(report.is_success());
+        assert_eq!(report.checked_observations, 1);
+    }
+
+    #[test]
+    fn verify_detects_output_hash_mismatch() {
+        let wasm = wat_bytes(r#"(module (func (export "_start")))"#);
+        let mut record = HllRecord::new(hash_bytes_hex(&wasm));
+        let mut observation = StoredObservation::from_observation(Observation {
+            program_hash: record.program_hash.clone(),
+            seed_hex: "aa".to_owned(),
+            stdout_hash: hash_bytes_hex(b"unexpected"),
+            status: RunStatus::Success,
+            fuel_consumed: 0,
+            config: RunConfig::default(),
+        });
+        observation.observation_hash =
+            observation_hash(&observation.to_observation(&record.program_hash));
+        record.insert_observation(observation).unwrap();
+        let report = verify_wasm_bytes(&wasm, &record).unwrap();
+        assert!(!report.is_success());
+        assert!(report.failures[0].reason.contains("stdout hash mismatch"));
     }
 
     #[test]

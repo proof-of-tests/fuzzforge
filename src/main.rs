@@ -1,14 +1,13 @@
 use std::{
-    fs,
-    io::{self, Read, Write},
+    io::{self, Write},
     path::PathBuf,
 };
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use fuzzforge::{
-    DEFAULT_FUEL, DEFAULT_MEMORY_BYTES, HLL_BUCKETS, HLL_PRECISION, RunConfig, Store,
-    hash_wasm_file, run_wasm,
+    DEFAULT_FUEL, DEFAULT_MEMORY_BYTES, DEFAULT_SEED_BYTES, HLL_BUCKETS, HLL_PRECISION, RunConfig,
+    Store, generate_seed, hash_wasm_file, run_wasm, seed_from_hex, verify_wasm,
 };
 
 #[derive(Debug, Parser)]
@@ -25,9 +24,13 @@ enum Command {
         /// Path to the WASM module.
         wasm: PathBuf,
 
-        /// Read guest stdin bytes from this file instead of process stdin.
+        /// Guest stdin seed as hex. If omitted, fuzzforge generates a random seed.
         #[arg(long)]
-        stdin_file: Option<PathBuf>,
+        seed: Option<String>,
+
+        /// Number of random seed bytes to generate when --seed is omitted.
+        #[arg(long, default_value_t = DEFAULT_SEED_BYTES)]
+        seed_bytes: usize,
 
         /// Store directory for HLL data.
         #[arg(long, default_value = ".fuzzforge")]
@@ -66,6 +69,16 @@ enum Command {
         #[arg(long, default_value = ".fuzzforge")]
         store: PathBuf,
     },
+
+    /// Re-run every stored seed and verify expected outputs and HLL hashes.
+    Verify {
+        /// Path to the WASM module.
+        wasm: PathBuf,
+
+        /// Store directory for HLL data.
+        #[arg(long, default_value = ".fuzzforge")]
+        store: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -73,20 +86,25 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Run {
             wasm,
-            stdin_file,
+            seed,
+            seed_bytes,
             store,
             fuel,
             memory_bytes,
             invoke,
             no_stdout,
         } => {
-            let stdin = read_guest_stdin(stdin_file.as_ref())?;
+            let seed = match seed {
+                Some(seed) => seed_from_hex(&seed)
+                    .with_context(|| format!("failed to parse seed `{seed}`"))?,
+                None => generate_seed(seed_bytes)?,
+            };
             let config = RunConfig {
                 fuel,
                 memory_bytes,
                 invoke,
             };
-            let result = run_wasm(&wasm, stdin, &store, config)
+            let result = run_wasm(&wasm, seed, &store, config)
                 .with_context(|| format!("failed to run {}", wasm.display()))?;
             if !no_stdout {
                 io::stdout()
@@ -94,6 +112,7 @@ fn main() -> Result<()> {
                     .context("failed to write guest stdout")?;
             }
             eprintln!("program_hash={}", result.program_hash);
+            eprintln!("seed={}", result.seed_hex);
             eprintln!("status={}", result.status);
             eprintln!("fuel_consumed={}", result.fuel_consumed);
             eprintln!("hll_precision={HLL_PRECISION}");
@@ -116,6 +135,7 @@ fn main() -> Result<()> {
             println!("precision={}", stats.precision);
             println!("buckets={}", stats.buckets);
             println!("runs={}", stats.run_count);
+            println!("stored_observations={}", stats.stored_observations);
             println!("estimated_observations={:.3}", stats.estimated_observations);
             println!(
                 "last_observation_hash={}",
@@ -135,23 +155,26 @@ fn main() -> Result<()> {
                 );
             }
         }
+        Command::Verify { wasm, store } => {
+            let report = verify_wasm(&wasm, &store)
+                .with_context(|| format!("failed to verify {}", wasm.display()))?;
+            println!("program_hash={}", report.program_hash);
+            println!("checked_observations={}", report.checked_observations);
+            println!("sketch_matches={}", report.sketch_matches);
+            if report.is_success() {
+                println!("verification=ok");
+            } else {
+                for failure in &report.failures {
+                    eprintln!("seed={} error={}", failure.seed_hex, failure.reason);
+                }
+                anyhow::bail!(
+                    "verification failed for {} stored observations",
+                    report.failures.len()
+                );
+            }
+        }
     }
     Ok(())
-}
-
-fn read_guest_stdin(stdin_file: Option<&PathBuf>) -> Result<Vec<u8>> {
-    match stdin_file {
-        Some(path) => {
-            fs::read(path).with_context(|| format!("failed to read stdin file {}", path.display()))
-        }
-        None => {
-            let mut bytes = Vec::new();
-            io::stdin()
-                .read_to_end(&mut bytes)
-                .context("failed to read process stdin")?;
-            Ok(bytes)
-        }
-    }
 }
 
 fn resolve_program_hash(value: &str) -> Result<String> {

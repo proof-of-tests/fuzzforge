@@ -6,13 +6,17 @@ compact HyperLogLog observations per WASM program hash.
 ## Usage
 
 ```sh
-cargo run -- run ./test.wasm --stdin-file ./input.bin
+cargo run -- run ./test.wasm
+cargo run -- run ./test.wasm --seed 68656c6c6f
 cargo run -- stats ./test.wasm
+cargo run -- verify ./test.wasm
 cargo run -- list
 ```
 
-The `run` command forwards captured guest stdout to process stdout by default and
-prints run metadata to stderr. Use `--no-stdout` to suppress stdout forwarding.
+The `run` command sends a seed to the guest as stdin. If `--seed <hex>` is not
+provided, fuzzforge generates a random seed and prints it to stderr with the run
+metadata. Captured guest stdout is forwarded to process stdout by default. Use
+`--no-stdout` to suppress stdout forwarding.
 
 ## Example WASI Program
 
@@ -26,7 +30,11 @@ cargo build \
   --target wasm32-wasip1 \
   --release \
   --target-dir target/echo-wasi
-printf 'hello fuzzforge' | cargo run -- run \
+cargo run -- run \
+  target/echo-wasi/wasm32-wasip1/release/echo-wasi.wasm \
+  --seed 68656c6c6f2066757a7a666f726765 \
+  --store .fuzzforge/examples
+cargo run -- verify \
   target/echo-wasi/wasm32-wasip1/release/echo-wasi.wasm \
   --store .fuzzforge/examples
 ```
@@ -49,13 +57,18 @@ or unsupported WASI APIs are rejected before execution.
 HLL records live under `.fuzzforge/hll/<program-hash>.json` by default.
 Program hashes are lowercase BLAKE3 hashes of the raw WASM bytes.
 
-Each run inserts one execution observation into a fixed-size HLL sketch:
+Each run stores its seed and expected result, then inserts one execution
+observation into a fixed-size HLL sketch:
 
 - program hash
-- stdin hash
+- seed bytes as hex
 - stdout hash
 - exit/trap status
 - fuel consumed
+
+`fuzzforge verify` reloads the stored seeds, reruns the program, checks that the
+new output/status/fuel match the stored expected values, and rebuilds the HLL
+registers to ensure the persisted sketch matches the verifiable observations.
 
 The HLL precision is fixed at `p = 6`, which means `2^6 = 64` buckets. This is
 intentionally compact and coarse, with an expected relative error of roughly 13%.

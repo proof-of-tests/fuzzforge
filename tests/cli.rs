@@ -1,7 +1,4 @@
-use std::{
-    fs,
-    process::{Command, Stdio},
-};
+use std::{fs, process::Command};
 
 use tempfile::tempdir;
 
@@ -32,17 +29,15 @@ fn echo_wasm() -> Vec<u8> {
 fn run_stats_and_list_persist_hll() {
     let temp = tempdir().expect("tempdir");
     let wasm_path = temp.path().join("echo.wasm");
-    let input_path = temp.path().join("input.bin");
     let store_path = temp.path().join("store");
     fs::write(&wasm_path, echo_wasm()).expect("write wasm");
-    fs::write(&input_path, b"hello cli").expect("write input");
 
     let run = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
         .args([
             "run",
             wasm_path.to_str().unwrap(),
-            "--stdin-file",
-            input_path.to_str().unwrap(),
+            "--seed",
+            "68656c6c6f20636c69",
             "--store",
             store_path.to_str().unwrap(),
         ])
@@ -52,6 +47,7 @@ fn run_stats_and_list_persist_hll() {
     assert_eq!(run.stdout, b"hello cli");
     assert!(stderr(&run).contains("hll_precision=6"));
     assert!(stderr(&run).contains("hll_buckets=64"));
+    assert!(stderr(&run).contains("seed=68656c6c6f20636c69"));
 
     let stats = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
         .args([
@@ -67,6 +63,7 @@ fn run_stats_and_list_persist_hll() {
     assert!(stats_stdout.contains("precision=6"));
     assert!(stats_stdout.contains("buckets=64"));
     assert!(stats_stdout.contains("runs=1"));
+    assert!(stats_stdout.contains("stored_observations=1"));
 
     let list = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
         .args(["list", "--store", store_path.to_str().unwrap()])
@@ -77,6 +74,19 @@ fn run_stats_and_list_persist_hll() {
     assert!(list_stdout.contains("runs=1"));
     assert!(list_stdout.contains("precision=6"));
     assert!(list_stdout.contains("buckets=64"));
+
+    let verify = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
+        .args([
+            "verify",
+            wasm_path.to_str().unwrap(),
+            "--store",
+            store_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("verify command");
+    assert!(verify.status.success(), "stderr: {}", stderr(&verify));
+    assert!(stdout(&verify).contains("verification=ok"));
+    assert!(stdout(&verify).contains("checked_observations=1"));
 }
 
 #[test]
@@ -87,22 +97,18 @@ fn repeated_runs_increment_run_count_without_stdout_forwarding() {
     fs::write(&wasm_path, echo_wasm()).expect("write wasm");
 
     for _ in 0..2 {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
+        let output = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
             .args([
                 "run",
                 wasm_path.to_str().unwrap(),
                 "--store",
                 store_path.to_str().unwrap(),
+                "--seed",
+                "73616d6520696e707574",
                 "--no-stdout",
             ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn run command");
-        std::io::Write::write_all(child.stdin.as_mut().unwrap(), b"same input")
-            .expect("write stdin");
-        let output = child.wait_with_output().expect("wait for run");
+            .output()
+            .expect("run command");
         assert!(output.status.success(), "stderr: {}", stderr(&output));
         assert!(output.stdout.is_empty());
     }
