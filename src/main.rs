@@ -1,7 +1,4 @@
-use std::{
-    io::{self, Write},
-    path::PathBuf,
-};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -53,14 +50,6 @@ enum Command {
         /// Invoke a no-arg export instead of the default WASI _start export.
         #[arg(long)]
         invoke: Option<String>,
-
-        /// Forward captured guest stdout to process stdout.
-        #[arg(long)]
-        stdout: bool,
-
-        /// Deprecated no-op. Guest stdout is suppressed by default.
-        #[arg(long, hide = true)]
-        no_stdout: bool,
     },
 
     /// Show HLL statistics for a WASM file or a program hash.
@@ -103,8 +92,6 @@ fn main() -> Result<()> {
             fuel,
             memory_bytes,
             invoke,
-            stdout,
-            no_stdout: _,
         } => {
             if count == 0 {
                 anyhow::bail!("--count must be greater than zero");
@@ -133,11 +120,6 @@ fn main() -> Result<()> {
                 };
                 let result = run_wasm(&wasm, seed, &store, config.clone())
                     .with_context(|| format!("failed to run {}", wasm.display()))?;
-                if stdout {
-                    io::stdout()
-                        .write_all(&result.stdout)
-                        .context("failed to write guest stdout")?;
-                }
                 proven_total = result.run_count;
             }
             eprintln!(

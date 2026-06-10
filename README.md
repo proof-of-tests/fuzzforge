@@ -18,9 +18,9 @@ The `run` command sends a seed to the guest as stdin. If `--seed <hex>` is not
 provided, fuzzforge generates random seeds and stores them with each observation.
 Use `--count <n>` to execute multiple runs with different generated seeds.
 `--seed` is accepted only when `--count=1`. Captured guest stdout is stored and
-hashed, but not forwarded to process stdout by default. Use `--stdout` to
-forward it for debugging. The command prints only the previous proven run count
-and the newly proven count for this invocation to stderr.
+hashed, but never forwarded to process stdout. The command prints only the
+previous proven run count and the newly proven count for this invocation to
+stderr.
 
 ## Example WASI Program
 

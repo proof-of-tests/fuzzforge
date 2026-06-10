@@ -88,30 +88,6 @@ fn run_stats_and_list_persist_hll() {
 }
 
 #[test]
-fn run_stdout_flag_forwards_guest_stdout() {
-    let temp = tempdir().expect("tempdir");
-    let wasm_path = temp.path().join("echo.wasm");
-    let store_path = temp.path().join("store");
-    fs::write(&wasm_path, echo_wasm()).expect("write wasm");
-
-    let run = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
-        .args([
-            "run",
-            wasm_path.to_str().unwrap(),
-            "--seed",
-            "68656c6c6f207374646f7574",
-            "--store",
-            store_path.to_str().unwrap(),
-            "--stdout",
-        ])
-        .output()
-        .expect("run command");
-    assert!(run.status.success(), "stderr: {}", stderr(&run));
-    assert_eq!(run.stdout, b"hello stdout");
-    assert_eq!(stderr(&run), "proven_before=0\nproven_added=1\n");
-}
-
-#[test]
 fn repeated_runs_increment_run_count_without_stdout_forwarding() {
     let temp = tempdir().expect("tempdir");
     let wasm_path = temp.path().join("echo.wasm");
@@ -127,7 +103,6 @@ fn repeated_runs_increment_run_count_without_stdout_forwarding() {
                 store_path.to_str().unwrap(),
                 "--seed",
                 "73616d6520696e707574",
-                "--no-stdout",
             ])
             .output()
             .expect("run command");
@@ -200,6 +175,22 @@ fn count_runs_multiple_generated_seeds_and_verifies() {
     assert!(verify.status.success(), "stderr: {}", stderr(&verify));
     assert!(stdout(&verify).contains("checked_observations=2"));
     assert!(stdout(&verify).contains("verification=ok"));
+}
+
+#[test]
+fn stdout_forwarding_flags_are_not_supported() {
+    let temp = tempdir().expect("tempdir");
+    let wasm_path = temp.path().join("echo.wasm");
+    fs::write(&wasm_path, echo_wasm()).expect("write wasm");
+
+    for flag in ["--stdout", "--no-stdout"] {
+        let run = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
+            .args(["run", wasm_path.to_str().unwrap(), flag])
+            .output()
+            .expect("run command");
+        assert!(!run.status.success());
+        assert!(stderr(&run).contains("unexpected argument"));
+    }
 }
 
 #[test]
