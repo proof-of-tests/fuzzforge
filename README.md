@@ -14,6 +14,23 @@ cargo run -- list
 The `run` command forwards captured guest stdout to process stdout by default and
 prints run metadata to stderr. Use `--no-stdout` to suppress stdout forwarding.
 
+## Example WASI Program
+
+`examples/echo-wasi/` contains a tiny Rust program that reads stdin and copies it
+to stdout. Build and run it from the repository root:
+
+```sh
+rustup target add wasm32-wasip1
+cargo build \
+  --manifest-path examples/echo-wasi/Cargo.toml \
+  --target wasm32-wasip1 \
+  --release \
+  --target-dir target/echo-wasi
+printf 'hello fuzzforge' | cargo run -- run \
+  target/echo-wasi/wasm32-wasip1/release/echo-wasi.wasm \
+  --store .fuzzforge/examples
+```
+
 ## Determinism
 
 The runner supports a strict WASI preview1 subset:
