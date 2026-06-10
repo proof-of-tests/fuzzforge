@@ -7,6 +7,7 @@ compact HyperLogLog observations per WASM program hash.
 
 ```sh
 cargo run -- run ./test.wasm
+cargo run -- run ./test.wasm --count=100 --no-stdout
 cargo run -- run ./test.wasm --seed 68656c6c6f
 cargo run -- stats ./test.wasm
 cargo run -- verify ./test.wasm
@@ -15,8 +16,10 @@ cargo run -- list
 
 The `run` command sends a seed to the guest as stdin. If `--seed <hex>` is not
 provided, fuzzforge generates a random seed and prints it to stderr with the run
-metadata. Captured guest stdout is forwarded to process stdout by default. Use
-`--no-stdout` to suppress stdout forwarding.
+metadata. Use `--count <n>` to execute multiple runs with different generated
+seeds. `--seed` is accepted only when `--count=1`. Captured guest stdout is
+forwarded to process stdout by default. Use `--no-stdout` to suppress stdout
+forwarding.
 
 ## Example WASI Program
 

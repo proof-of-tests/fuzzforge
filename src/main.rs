@@ -10,6 +10,8 @@ use fuzzforge::{
     Store, generate_seed, hash_wasm_file, run_wasm, seed_from_hex, verify_wasm,
 };
 
+const DEFAULT_RUN_COUNT: usize = 1;
+
 #[derive(Debug, Parser)]
 #[command(version, about = "Run deterministic local WASM fuzz tests with wasmi")]
 struct Cli {
@@ -31,6 +33,10 @@ enum Command {
         /// Number of random seed bytes to generate when --seed is omitted.
         #[arg(long, default_value_t = DEFAULT_SEED_BYTES)]
         seed_bytes: usize,
+
+        /// Number of fuzz runs to execute, each with a different generated seed.
+        #[arg(long, default_value_t = DEFAULT_RUN_COUNT)]
+        count: usize,
 
         /// Store directory for HLL data.
         #[arg(long, default_value = ".fuzzforge")]
@@ -88,37 +94,48 @@ fn main() -> Result<()> {
             wasm,
             seed,
             seed_bytes,
+            count,
             store,
             fuel,
             memory_bytes,
             invoke,
             no_stdout,
         } => {
-            let seed = match seed {
-                Some(seed) => seed_from_hex(&seed)
-                    .with_context(|| format!("failed to parse seed `{seed}`"))?,
-                None => generate_seed(seed_bytes)?,
-            };
+            if count == 0 {
+                anyhow::bail!("--count must be greater than zero");
+            }
+            if seed.is_some() && count != 1 {
+                anyhow::bail!("--seed can only be used when --count=1");
+            }
             let config = RunConfig {
                 fuel,
                 memory_bytes,
                 invoke,
             };
-            let result = run_wasm(&wasm, seed, &store, config)
-                .with_context(|| format!("failed to run {}", wasm.display()))?;
-            if !no_stdout {
-                io::stdout()
-                    .write_all(&result.stdout)
-                    .context("failed to write guest stdout")?;
+            for run_index in 1..=count {
+                let seed = match seed.as_ref() {
+                    Some(seed) => seed_from_hex(seed)
+                        .with_context(|| format!("failed to parse seed `{seed}`"))?,
+                    None => generate_seed(seed_bytes)?,
+                };
+                let result = run_wasm(&wasm, seed, &store, config.clone())
+                    .with_context(|| format!("failed to run {}", wasm.display()))?;
+                if !no_stdout {
+                    io::stdout()
+                        .write_all(&result.stdout)
+                        .context("failed to write guest stdout")?;
+                }
+                eprintln!("run_index={run_index}");
+                eprintln!("run_count={count}");
+                eprintln!("program_hash={}", result.program_hash);
+                eprintln!("seed={}", result.seed_hex);
+                eprintln!("status={}", result.status);
+                eprintln!("fuel_consumed={}", result.fuel_consumed);
+                eprintln!("hll_precision={HLL_PRECISION}");
+                eprintln!("hll_buckets={HLL_BUCKETS}");
+                eprintln!("hll_runs={}", result.run_count);
+                eprintln!("hll_estimate={:.3}", result.estimated_observations);
             }
-            eprintln!("program_hash={}", result.program_hash);
-            eprintln!("seed={}", result.seed_hex);
-            eprintln!("status={}", result.status);
-            eprintln!("fuel_consumed={}", result.fuel_consumed);
-            eprintln!("hll_precision={HLL_PRECISION}");
-            eprintln!("hll_buckets={HLL_BUCKETS}");
-            eprintln!("hll_runs={}", result.run_count);
-            eprintln!("hll_estimate={:.3}", result.estimated_observations);
         }
         Command::Stats {
             wasm_or_hash,

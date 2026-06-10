@@ -126,6 +126,85 @@ fn repeated_runs_increment_run_count_without_stdout_forwarding() {
     assert!(stdout(&stats).contains("runs=2"));
 }
 
+#[test]
+fn count_runs_multiple_generated_seeds_and_verifies() {
+    let temp = tempdir().expect("tempdir");
+    let wasm_path = temp.path().join("echo.wasm");
+    let store_path = temp.path().join("store");
+    fs::write(&wasm_path, echo_wasm()).expect("write wasm");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
+        .args([
+            "run",
+            wasm_path.to_str().unwrap(),
+            "--store",
+            store_path.to_str().unwrap(),
+            "--count=2",
+            "--no-stdout",
+        ])
+        .output()
+        .expect("run command");
+    assert!(run.status.success(), "stderr: {}", stderr(&run));
+    assert!(run.stdout.is_empty());
+
+    let run_stderr = stderr(&run);
+    assert!(run_stderr.contains("run_index=1"));
+    assert!(run_stderr.contains("run_index=2"));
+    let seeds: Vec<&str> = run_stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("seed="))
+        .collect();
+    assert_eq!(seeds.len(), 2);
+    assert_ne!(seeds[0], seeds[1]);
+
+    let stats = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
+        .args([
+            "stats",
+            wasm_path.to_str().unwrap(),
+            "--store",
+            store_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("stats command");
+    assert!(stats.status.success(), "stderr: {}", stderr(&stats));
+    let stats_stdout = stdout(&stats);
+    assert!(stats_stdout.contains("runs=2"));
+    assert!(stats_stdout.contains("stored_observations=2"));
+
+    let verify = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
+        .args([
+            "verify",
+            wasm_path.to_str().unwrap(),
+            "--store",
+            store_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("verify command");
+    assert!(verify.status.success(), "stderr: {}", stderr(&verify));
+    assert!(stdout(&verify).contains("checked_observations=2"));
+    assert!(stdout(&verify).contains("verification=ok"));
+}
+
+#[test]
+fn count_rejects_explicit_seed_for_multiple_runs() {
+    let temp = tempdir().expect("tempdir");
+    let wasm_path = temp.path().join("echo.wasm");
+    fs::write(&wasm_path, echo_wasm()).expect("write wasm");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
+        .args([
+            "run",
+            wasm_path.to_str().unwrap(),
+            "--seed",
+            "00",
+            "--count=2",
+        ])
+        .output()
+        .expect("run command");
+    assert!(!run.status.success());
+    assert!(stderr(&run).contains("--seed can only be used when --count=1"));
+}
+
 fn stdout(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
