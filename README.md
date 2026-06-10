@@ -42,3 +42,5 @@ Each run inserts one execution observation into a fixed-size HLL sketch:
 
 The HLL precision is fixed at `p = 6`, which means `2^6 = 64` buckets. This is
 intentionally compact and coarse, with an expected relative error of roughly 13%.
+The sketch implementation is maintained in this crate instead of depending on
+an external HyperLogLog package.

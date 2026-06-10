@@ -1,11 +1,9 @@
 use std::{
     fmt, fs,
-    hash::{BuildHasher, Hasher},
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
-use hyperloglogplus::{HyperLogLog, HyperLogLogPF};
 use serde::{Deserialize, Serialize};
 use wasmi::{
     Caller, Config, Engine, ExternType, Linker, Memory, Module, Store as WasmiStore, StoreLimits,
@@ -117,21 +115,20 @@ impl HllRecord {
             precision: HLL_PRECISION,
             run_count: 0,
             last_observation_hash: None,
-            sketch: HyperLogLogPF::new(HLL_PRECISION, PassThroughBuildHasher)
-                .expect("fixed HLL precision is valid"),
+            sketch: Sketch::new(),
         }
     }
 
     pub fn insert_observation(&mut self, observation_hash: &str) -> Result<()> {
         self.validate()?;
         let value = observation_hash_to_u64(observation_hash)?;
-        self.sketch.insert(&value);
+        self.sketch.insert_hash(value);
         self.run_count = self.run_count.saturating_add(1);
         self.last_observation_hash = Some(observation_hash.to_owned());
         Ok(())
     }
 
-    pub fn stats(&mut self) -> HllStats {
+    pub fn stats(&self) -> HllStats {
         HllStats {
             schema_version: self.schema_version,
             program_hash: self.program_hash.clone(),
@@ -139,7 +136,7 @@ impl HllRecord {
             buckets: 1usize << self.precision,
             run_count: self.run_count,
             last_observation_hash: self.last_observation_hash.clone(),
-            estimated_observations: self.sketch.count(),
+            estimated_observations: self.sketch.estimate(),
         }
     }
 
@@ -153,43 +150,75 @@ impl HllRecord {
                 self.precision
             );
         }
+        self.sketch.validate()?;
         Ok(())
     }
 }
 
-pub type Sketch = HyperLogLogPF<u64, PassThroughBuildHasher>;
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct PassThroughBuildHasher;
-
-impl BuildHasher for PassThroughBuildHasher {
-    type Hasher = PassThroughHasher;
-
-    fn build_hasher(&self) -> Self::Hasher {
-        PassThroughHasher::default()
-    }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Sketch {
+    registers: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PassThroughHasher {
-    value: u64,
-}
-
-impl Hasher for PassThroughHasher {
-    fn finish(&self) -> u64 {
-        self.value
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        self.value = 0xcbf2_9ce4_8422_2325;
-        for byte in bytes {
-            self.value ^= u64::from(*byte);
-            self.value = self.value.wrapping_mul(0x0000_0100_0000_01b3);
+impl Sketch {
+    pub fn new() -> Self {
+        Self {
+            registers: vec![0; HLL_BUCKETS],
         }
     }
 
-    fn write_u64(&mut self, value: u64) {
-        self.value = value;
+    pub fn insert_hash(&mut self, hash: u64) {
+        debug_assert_eq!(self.registers.len(), HLL_BUCKETS);
+        let bucket = (hash >> (u64::BITS - u32::from(HLL_PRECISION))) as usize;
+        let remaining = hash << HLL_PRECISION;
+        let max_rank = u64::BITS - u32::from(HLL_PRECISION) + 1;
+        let rank = if remaining == 0 {
+            max_rank
+        } else {
+            (remaining.leading_zeros() + 1).min(max_rank)
+        } as u8;
+        self.registers[bucket] = self.registers[bucket].max(rank);
+    }
+
+    pub fn estimate(&self) -> f64 {
+        let m = HLL_BUCKETS as f64;
+        let sum: f64 = self
+            .registers
+            .iter()
+            .map(|rank| 2.0_f64.powi(-i32::from(*rank)))
+            .sum();
+        let raw = alpha(HLL_BUCKETS) * m * m / sum;
+        let zeros = self.registers.iter().filter(|rank| **rank == 0).count();
+        if raw <= 2.5 * m && zeros > 0 {
+            m * (m / zeros as f64).ln()
+        } else {
+            raw
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.registers.len() != HLL_BUCKETS {
+            bail!(
+                "invalid HLL register count {}; expected {HLL_BUCKETS}",
+                self.registers.len()
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Default for Sketch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn alpha(bucket_count: usize) -> f64 {
+    match bucket_count {
+        16 => 0.673,
+        32 => 0.697,
+        64 => 0.709,
+        count => 0.7213 / (1.0 + 1.079 / count as f64),
     }
 }
 
@@ -244,7 +273,7 @@ impl Store {
     }
 
     pub fn stats(&self, program_hash: &str) -> Result<HllStats> {
-        let mut record = self.load_or_new(program_hash)?;
+        let record = self.load_or_new(program_hash)?;
         Ok(record.stats())
     }
 
@@ -686,7 +715,7 @@ mod tests {
             .insert_observation(&"1".repeat(64))
             .expect("insert observation");
         let json = serde_json::to_string(&record).expect("serialize");
-        let mut restored: HllRecord = serde_json::from_str(&json).expect("deserialize");
+        let restored: HllRecord = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored.schema_version, SCHEMA_VERSION);
         assert_eq!(restored.precision, HLL_PRECISION);
         assert_eq!(restored.run_count, 1);
@@ -706,6 +735,29 @@ mod tests {
         let second = record.stats().estimated_observations;
         assert_eq!(record.run_count, 2);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn distinct_hll_observations_increase_estimate() {
+        let mut record = HllRecord::new("a".repeat(64));
+        record
+            .insert_observation(&"2".repeat(64))
+            .expect("first insert");
+        let first = record.stats().estimated_observations;
+        record
+            .insert_observation(&"3".repeat(64))
+            .expect("second insert");
+        let second = record.stats().estimated_observations;
+        assert_eq!(record.run_count, 2);
+        assert!(second > first);
+    }
+
+    #[test]
+    fn hll_register_count_is_validated() {
+        let mut record = HllRecord::new("a".repeat(64));
+        record.sketch.registers.pop();
+        let err = record.validate().unwrap_err();
+        assert!(err.to_string().contains("register count"));
     }
 
     #[test]
