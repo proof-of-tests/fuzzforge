@@ -2,8 +2,9 @@ use std::{
     io::{self, IsTerminal, Write},
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver},
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -201,24 +202,24 @@ fn resolve_program_hash(value: &str) -> Result<String> {
 struct ProgressDisplay {
     proven_before: f64,
     update_in_place: bool,
-    proven_added: Arc<Mutex<f64>>,
-    output: Arc<Mutex<()>>,
+    proven_added: Arc<atomic_float::AtomicF64>,
     running: Arc<AtomicBool>,
     spinner: Option<JoinHandle<()>>,
+    spinner_done: Option<Receiver<()>>,
     finished: bool,
 }
 
 impl ProgressDisplay {
     fn start(proven_before: f64, update_in_place: bool) -> Self {
         eprintln!("proven_before={proven_before:.3}");
-        let proven_added = Arc::new(Mutex::new(0.0));
-        let output = Arc::new(Mutex::new(()));
+        let proven_added = Arc::new(atomic_float::AtomicF64::new(0.0));
         let running = Arc::new(AtomicBool::new(update_in_place));
+        let (done_tx, done_rx) = mpsc::channel();
         let spinner = if update_in_place {
             Some(spawn_spinner(
                 Arc::clone(&proven_added),
-                Arc::clone(&output),
                 Arc::clone(&running),
+                done_tx,
             ))
         } else {
             None
@@ -227,30 +228,28 @@ impl ProgressDisplay {
             proven_before,
             update_in_place,
             proven_added,
-            output,
             running,
             spinner,
+            spinner_done: Some(done_rx),
             finished: false,
         }
     }
 
     fn update(&self, estimated_observations: f64) -> Result<()> {
         let proven_added = (estimated_observations - self.proven_before).max(0.0);
-        *self
-            .proven_added
-            .lock()
-            .map_err(|_| anyhow::anyhow!("progress state lock poisoned"))? = proven_added;
-        self.write_progress(proven_added, None, !self.update_in_place)
+        self.proven_added.store(proven_added, Ordering::Relaxed);
+        if self.update_in_place {
+            Ok(())
+        } else {
+            self.write_progress(proven_added, true)
+        }
     }
 
     fn finish(&mut self) -> Result<()> {
         self.stop_spinner();
         if self.update_in_place {
-            let proven_added = *self
-                .proven_added
-                .lock()
-                .map_err(|_| anyhow::anyhow!("progress state lock poisoned"))?;
-            self.write_progress(proven_added, None, true)?;
+            let proven_added = self.proven_added.load(Ordering::Relaxed);
+            self.write_progress(proven_added, true)?;
         }
         self.finished = true;
         Ok(())
@@ -258,28 +257,23 @@ impl ProgressDisplay {
 
     fn stop_spinner(&mut self) {
         self.running.store(false, Ordering::Relaxed);
-        if let Some(spinner) = self.spinner.take() {
+        if let Some(done) = self.spinner_done.take() {
+            let _ = done.recv_timeout(Duration::from_millis(50));
+        }
+        if self
+            .spinner
+            .as_ref()
+            .is_some_and(|spinner| spinner.is_finished())
+            && let Some(spinner) = self.spinner.take()
+        {
             let _ = spinner.join();
         }
     }
 
-    fn write_progress(
-        &self,
-        proven_added: f64,
-        spinner: Option<char>,
-        newline: bool,
-    ) -> Result<()> {
-        let _guard = self
-            .output
-            .lock()
-            .map_err(|_| anyhow::anyhow!("progress output lock poisoned"))?;
+    fn write_progress(&self, proven_added: f64, newline: bool) -> Result<()> {
         let mut stderr = io::stderr().lock();
         if self.update_in_place {
-            write!(stderr, "\rproven_added={proven_added:.3}")?;
-            match spinner {
-                Some(frame) => write!(stderr, " {frame}")?,
-                None => write!(stderr, "  ")?,
-            }
+            write!(stderr, "\rproven_added={proven_added:.3}  ")?;
         } else {
             write!(stderr, "proven_added={proven_added:.3}")?;
         }
@@ -296,28 +290,21 @@ impl Drop for ProgressDisplay {
         if !self.update_in_place || self.finished {
             return;
         }
-        let Ok(_guard) = self.output.lock() else {
-            return;
-        };
         let _ = writeln!(io::stderr().lock());
     }
 }
 
 fn spawn_spinner(
-    proven_added: Arc<Mutex<f64>>,
-    output: Arc<Mutex<()>>,
+    proven_added: Arc<atomic_float::AtomicF64>,
     running: Arc<AtomicBool>,
+    done: mpsc::Sender<()>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
+        const FRAME_INTERVAL: Duration = Duration::from_millis(250);
         const FRAMES: [char; 4] = ['|', '/', '-', '\\'];
         let mut frame_index = 0;
         while running.load(Ordering::Relaxed) {
-            let Ok(proven_added) = proven_added.lock().map(|value| *value) else {
-                break;
-            };
-            let Ok(_guard) = output.lock() else {
-                break;
-            };
+            let proven_added = proven_added.load(Ordering::Relaxed);
             let mut stderr = io::stderr().lock();
             let _ = write!(
                 stderr,
@@ -326,7 +313,33 @@ fn spawn_spinner(
             );
             let _ = stderr.flush();
             frame_index = (frame_index + 1) % FRAMES.len();
-            thread::sleep(Duration::from_millis(120));
+            thread::sleep(FRAME_INTERVAL);
         }
+        let _ = done.send(());
     })
+}
+
+mod atomic_float {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[derive(Debug)]
+    pub struct AtomicF64 {
+        bits: AtomicU64,
+    }
+
+    impl AtomicF64 {
+        pub fn new(value: f64) -> Self {
+            Self {
+                bits: AtomicU64::new(value.to_bits()),
+            }
+        }
+
+        pub fn load(&self, order: Ordering) -> f64 {
+            f64::from_bits(self.bits.load(order))
+        }
+
+        pub fn store(&self, value: f64, order: Ordering) {
+            self.bits.store(value.to_bits(), order);
+        }
+    }
 }
