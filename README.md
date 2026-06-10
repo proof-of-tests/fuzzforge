@@ -20,7 +20,8 @@ Use `--count <n>` to execute multiple runs with different generated seeds.
 `--seed` is accepted only when `--count=1`. Captured guest stdout is stored and
 hashed, but never forwarded to process stdout. The command prints the previous
 HLL estimate as `proven_before=<estimate>`, then updates
-`proven_added=<estimate>` after each HLL sketch update.
+`proven_added=<estimate>` after each HLL sketch update. When stderr is a
+terminal, the progress line includes a spinner while a run is executing.
 
 ## Example WASI Program
 
