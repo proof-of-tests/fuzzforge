@@ -8,6 +8,7 @@ compact HyperLogLog observations per WASM program hash.
 ```sh
 cargo run -- run ./test.wasm
 cargo run -- run ./test.wasm --count=100
+cargo run -- run ./test.wasm --count=1000 --save-fuel-interval=1000000000
 cargo run -- run ./test.wasm --seed 68656c6c6f
 cargo run -- stats ./test.wasm
 cargo run -- verify ./test.wasm
@@ -22,6 +23,9 @@ hashed, but never forwarded to process stdout. The command prints the previous
 HLL estimate as `proven_before=<estimate>`, then updates
 `proven_added=<estimate>` after each HLL sketch update. When stderr is a
 terminal, the progress line includes a spinner while a run is executing.
+For multi-run batches, fuzzforge keeps the compiled WASM module and HLL record
+in memory, then persists progress after `--save-fuel-interval` guest fuel has
+been consumed and once more at the end of the batch.
 
 ## Example WASI Program
 

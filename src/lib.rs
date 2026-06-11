@@ -14,6 +14,7 @@ pub const HLL_PRECISION: u8 = 6;
 pub const HLL_BUCKETS: usize = 1 << HLL_PRECISION;
 pub const SCHEMA_VERSION: u32 = 2;
 pub const DEFAULT_FUEL: u64 = 10_000_000;
+pub const DEFAULT_SAVE_FUEL_INTERVAL: u64 = DEFAULT_FUEL * 100;
 pub const DEFAULT_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_SEED_BYTES: usize = 32;
 const DEFAULT_TABLE_ELEMENTS: usize = 10_000;
@@ -156,6 +157,13 @@ impl HllRecord {
 
     pub fn insert_observation(&mut self, observation: StoredObservation) -> Result<()> {
         self.validate()?;
+        self.insert_observation_into_valid_record(observation)
+    }
+
+    fn insert_observation_into_valid_record(
+        &mut self,
+        observation: StoredObservation,
+    ) -> Result<()> {
         observation.validate(&self.program_hash)?;
         let value = observation_hash_to_u64(&observation.observation_hash)?;
         self.sketch.insert_hash(value);
@@ -346,7 +354,7 @@ impl Store {
 
     pub fn update(&self, program_hash: &str, observation: StoredObservation) -> Result<HllStats> {
         let mut record = self.load_or_new(program_hash)?;
-        record.insert_observation(observation)?;
+        record.insert_observation_into_valid_record(observation)?;
         let stats = record.stats();
         self.save(&record)?;
         Ok(stats)
@@ -440,6 +448,158 @@ pub fn observation_hash(observation: &Observation) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+pub struct WasmProgram {
+    program_hash: String,
+    engine: Engine,
+    module: Module,
+    linker: Linker<HostState>,
+}
+
+impl WasmProgram {
+    pub fn compile(wasm: &[u8]) -> Result<Self> {
+        let program_hash = hash_bytes_hex(wasm);
+        let mut wasmi_config = Config::default();
+        wasmi_config.consume_fuel(true);
+        let engine = Engine::new(&wasmi_config);
+        let module = Module::new(&engine, wasm).context("failed to compile WASM module")?;
+        validate_imports(&module)?;
+
+        let mut linker = Linker::<HostState>::new(&engine);
+        add_wasi_functions(&mut linker)?;
+        Ok(Self {
+            program_hash,
+            engine,
+            module,
+            linker,
+        })
+    }
+
+    pub fn program_hash(&self) -> &str {
+        &self.program_hash
+    }
+
+    fn execute(&self, stdin: Vec<u8>, config: RunConfig) -> Result<ExecutionOutput> {
+        let limits = StoreLimitsBuilder::new()
+            .memory_size(config.memory_bytes)
+            .table_elements(DEFAULT_TABLE_ELEMENTS)
+            .instances(1)
+            .memories(1)
+            .tables(1)
+            .trap_on_grow_failure(true)
+            .build();
+        let state = HostState {
+            stdin,
+            stdin_pos: 0,
+            stdout: Vec::new(),
+            limits,
+        };
+        let mut store = WasmiStore::new(&self.engine, state);
+        store.limiter(|state| &mut state.limits);
+        store.set_fuel(config.fuel).context("failed to set fuel")?;
+
+        let instance = self
+            .linker
+            .instantiate_and_start(&mut store, &self.module)
+            .context("failed to instantiate WASM module")?;
+        let export = config.invoke.as_deref().unwrap_or("_start");
+        let func = instance
+            .get_typed_func::<(), ()>(&store, export)
+            .with_context(|| format!("missing no-arg export `{export}`"))?;
+        let status = match func.call(&mut store, ()) {
+            Ok(()) => RunStatus::Success,
+            Err(error) => {
+                if let Some(code) = error.i32_exit_status() {
+                    RunStatus::Exit(code)
+                } else if let Some(trap_code) = error.as_trap_code() {
+                    RunStatus::Trap(format!("{trap_code:?}"))
+                } else {
+                    RunStatus::Trap(error.to_string())
+                }
+            }
+        };
+        let fuel_remaining = store.get_fuel().context("failed to read remaining fuel")?;
+        let stdout = std::mem::take(&mut store.data_mut().stdout);
+        Ok(ExecutionOutput {
+            status,
+            fuel_consumed: config.fuel.saturating_sub(fuel_remaining),
+            fuel_remaining,
+            stdout,
+        })
+    }
+}
+
+pub struct RunSession {
+    program: WasmProgram,
+    store: Store,
+    record: HllRecord,
+    config: RunConfig,
+    unsaved_fuel: u64,
+    has_unsaved_observations: bool,
+}
+
+impl RunSession {
+    pub fn from_wasm_path(wasm_path: &Path, store_path: &Path, config: RunConfig) -> Result<Self> {
+        let wasm = fs::read(wasm_path)
+            .with_context(|| format!("failed to read WASM module {}", wasm_path.display()))?;
+        Self::from_wasm_bytes(&wasm, store_path, config)
+    }
+
+    pub fn from_wasm_bytes(wasm: &[u8], store_path: &Path, config: RunConfig) -> Result<Self> {
+        let program = WasmProgram::compile(wasm)?;
+        let store = Store::new(store_path);
+        let record = store.load_or_new(program.program_hash())?;
+        Ok(Self {
+            program,
+            store,
+            record,
+            config,
+            unsaved_fuel: 0,
+            has_unsaved_observations: false,
+        })
+    }
+
+    pub fn program_hash(&self) -> &str {
+        self.program.program_hash()
+    }
+
+    pub fn stats(&self) -> HllStats {
+        self.record.stats()
+    }
+
+    pub fn run(&mut self, seed: Vec<u8>) -> Result<RunResult> {
+        let result = run_compiled_wasm(&self.program, &mut self.record, seed, self.config.clone())?;
+        self.unsaved_fuel = self.unsaved_fuel.saturating_add(result.fuel_consumed);
+        self.has_unsaved_observations = true;
+        Ok(result)
+    }
+
+    pub fn save_after_fuel(&mut self, fuel_interval: u64) -> Result<bool> {
+        if fuel_interval == 0 {
+            bail!("save fuel interval must be greater than zero");
+        }
+        if self.has_unsaved_observations && self.unsaved_fuel >= fuel_interval {
+            self.save()?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    pub fn save_pending(&mut self) -> Result<bool> {
+        if !self.has_unsaved_observations {
+            return Ok(false);
+        }
+        self.save()?;
+        Ok(true)
+    }
+
+    pub fn save(&mut self) -> Result<()> {
+        self.store.save(&self.record)?;
+        self.unsaved_fuel = 0;
+        self.has_unsaved_observations = false;
+        Ok(())
+    }
+}
+
 pub fn run_wasm(
     wasm_path: &Path,
     seed: Vec<u8>,
@@ -460,9 +620,25 @@ pub fn run_wasm_bytes(
     if seed.is_empty() {
         bail!("seed must not be empty");
     }
-    let program_hash = hash_bytes_hex(wasm);
+    let mut session = RunSession::from_wasm_bytes(wasm, store_path, config)?;
+    let result = session.run(seed)?;
+    session.save()?;
+    Ok(result)
+}
+
+fn run_compiled_wasm(
+    program: &WasmProgram,
+    record: &mut HllRecord,
+    seed: Vec<u8>,
+    config: RunConfig,
+) -> Result<RunResult> {
+    if seed.is_empty() {
+        bail!("seed must not be empty");
+    }
+    debug_assert_eq!(record.program_hash, program.program_hash());
+    let program_hash = program.program_hash().to_owned();
     let seed_hex = seed_to_hex(&seed);
-    let output = execute_wasm(wasm, seed, config.clone())?;
+    let output = program.execute(seed, config.clone())?;
     let stdout_hash = hash_bytes_hex(&output.stdout);
     let observation = Observation {
         program_hash: program_hash.clone(),
@@ -474,7 +650,8 @@ pub fn run_wasm_bytes(
     };
     let stored_observation = StoredObservation::from_observation(observation);
     let observation_hash = stored_observation.observation_hash.clone();
-    let stats = Store::new(store_path).update(&program_hash, stored_observation)?;
+    record.insert_observation_into_valid_record(stored_observation)?;
+    let stats = record.stats();
     Ok(RunResult {
         program_hash,
         seed_hex,
@@ -505,21 +682,21 @@ pub fn verify_wasm_bytes(wasm: &[u8], record: &HllRecord) -> Result<VerifyReport
             record.program_hash
         );
     }
-    let program_hash = hash_bytes_hex(wasm);
-    if record.program_hash != program_hash {
+    let program = WasmProgram::compile(wasm)?;
+    if record.program_hash != program.program_hash() {
         bail!(
             "WASM hash mismatch: record is {}, input is {}",
             record.program_hash,
-            program_hash
+            program.program_hash()
         );
     }
 
     let mut failures = Vec::new();
     let mut rebuilt = HllRecord::new(record.program_hash.clone());
     for expected in &record.observations {
-        match verify_observation(wasm, &record.program_hash, expected) {
+        match verify_observation(&program, &record.program_hash, expected) {
             Ok(actual) => {
-                if let Err(error) = rebuilt.insert_observation(actual) {
+                if let Err(error) = rebuilt.insert_observation_into_valid_record(actual) {
                     failures.push(VerifyFailure {
                         seed_hex: expected.seed_hex.clone(),
                         reason: error.to_string(),
@@ -549,12 +726,12 @@ pub fn verify_wasm_bytes(wasm: &[u8], record: &HllRecord) -> Result<VerifyReport
 }
 
 fn verify_observation(
-    wasm: &[u8],
+    program: &WasmProgram,
     program_hash: &str,
     expected: &StoredObservation,
 ) -> Result<StoredObservation> {
     let seed = seed_from_hex(&expected.seed_hex)?;
-    let output = execute_wasm(wasm, seed, expected.config.clone())?;
+    let output = program.execute(seed, expected.config.clone())?;
     let stdout_hash = hash_bytes_hex(&output.stdout);
     if stdout_hash != expected.stdout_hash {
         bail!(
@@ -611,60 +788,9 @@ struct HostState {
     limits: StoreLimits,
 }
 
+#[cfg(test)]
 fn execute_wasm(wasm: &[u8], stdin: Vec<u8>, config: RunConfig) -> Result<ExecutionOutput> {
-    let mut wasmi_config = Config::default();
-    wasmi_config.consume_fuel(true);
-    let engine = Engine::new(&wasmi_config);
-    let module = Module::new(&engine, wasm).context("failed to compile WASM module")?;
-    validate_imports(&module)?;
-
-    let limits = StoreLimitsBuilder::new()
-        .memory_size(config.memory_bytes)
-        .table_elements(DEFAULT_TABLE_ELEMENTS)
-        .instances(1)
-        .memories(1)
-        .tables(1)
-        .trap_on_grow_failure(true)
-        .build();
-    let state = HostState {
-        stdin,
-        stdin_pos: 0,
-        stdout: Vec::new(),
-        limits,
-    };
-    let mut store = WasmiStore::new(&engine, state);
-    store.limiter(|state| &mut state.limits);
-    store.set_fuel(config.fuel).context("failed to set fuel")?;
-
-    let mut linker = Linker::<HostState>::new(&engine);
-    add_wasi_functions(&mut linker)?;
-    let instance = linker
-        .instantiate_and_start(&mut store, &module)
-        .context("failed to instantiate WASM module")?;
-    let export = config.invoke.as_deref().unwrap_or("_start");
-    let func = instance
-        .get_typed_func::<(), ()>(&store, export)
-        .with_context(|| format!("missing no-arg export `{export}`"))?;
-    let status = match func.call(&mut store, ()) {
-        Ok(()) => RunStatus::Success,
-        Err(error) => {
-            if let Some(code) = error.i32_exit_status() {
-                RunStatus::Exit(code)
-            } else if let Some(trap_code) = error.as_trap_code() {
-                RunStatus::Trap(format!("{trap_code:?}"))
-            } else {
-                RunStatus::Trap(error.to_string())
-            }
-        }
-    };
-    let fuel_remaining = store.get_fuel().context("failed to read remaining fuel")?;
-    let stdout = store.data().stdout.clone();
-    Ok(ExecutionOutput {
-        status,
-        fuel_consumed: config.fuel.saturating_sub(fuel_remaining),
-        fuel_remaining,
-        stdout,
-    })
+    WasmProgram::compile(wasm)?.execute(stdin, config)
 }
 
 fn validate_imports(module: &Module) -> Result<()> {
@@ -1056,6 +1182,74 @@ mod tests {
         let report = verify_wasm_bytes(&wasm, &record).unwrap();
         assert!(report.is_success());
         assert_eq!(report.checked_observations, 1);
+    }
+
+    #[test]
+    fn run_session_saves_after_fuel_interval() {
+        let wasm = wat_bytes(
+            r#"
+            (module
+              (func (export "_start")
+                (local $i i32)
+                (loop $again
+                  local.get $i
+                  i32.const 1
+                  i32.add
+                  local.tee $i
+                  i32.const 1000
+                  i32.lt_u
+                  br_if $again)))
+            "#,
+        );
+        let store = tempdir().expect("tempdir");
+        let mut session =
+            RunSession::from_wasm_bytes(&wasm, store.path(), RunConfig::default()).unwrap();
+        let program_hash = session.program_hash().to_owned();
+
+        let first = session.run(b"first".to_vec()).unwrap();
+        assert!(first.fuel_consumed > 0);
+        assert!(
+            !session
+                .save_after_fuel(first.fuel_consumed.saturating_add(1))
+                .unwrap()
+        );
+        assert_eq!(
+            Store::new(store.path())
+                .stats(&program_hash)
+                .unwrap()
+                .stored_observations,
+            0
+        );
+
+        assert!(session.save_after_fuel(first.fuel_consumed).unwrap());
+        assert_eq!(
+            Store::new(store.path())
+                .stats(&program_hash)
+                .unwrap()
+                .stored_observations,
+            1
+        );
+
+        let second = session.run(b"second".to_vec()).unwrap();
+        assert!(second.fuel_consumed > 0);
+        assert!(!session.save_after_fuel(u64::MAX).unwrap());
+        assert_eq!(
+            Store::new(store.path())
+                .stats(&program_hash)
+                .unwrap()
+                .stored_observations,
+            1
+        );
+
+        assert!(session.save_pending().unwrap());
+        assert_eq!(
+            Store::new(store.path())
+                .stats(&program_hash)
+                .unwrap()
+                .stored_observations,
+            2
+        );
+        assert!(!session.save_pending().unwrap());
     }
 
     #[test]
