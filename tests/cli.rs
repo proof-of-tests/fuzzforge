@@ -272,6 +272,20 @@ fn count_rejects_explicit_seed_for_multiple_runs() {
     assert!(stderr(&run).contains("--seed can only be used when --count=1"));
 }
 
+#[test]
+fn save_fuel_interval_must_be_nonzero() {
+    let temp = tempdir().expect("tempdir");
+    let wasm_path = temp.path().join("echo.wasm");
+    fs::write(&wasm_path, echo_wasm()).expect("write wasm");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
+        .args(["run", wasm_path.to_str().unwrap(), "--save-fuel-interval=0"])
+        .output()
+        .expect("run command");
+    assert!(!run.status.success());
+    assert!(stderr(&run).contains("--save-fuel-interval must be greater than zero"));
+}
+
 fn stdout(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }

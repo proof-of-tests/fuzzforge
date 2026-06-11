@@ -13,8 +13,8 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use fuzzforge::{
-    DEFAULT_FUEL, DEFAULT_MEMORY_BYTES, DEFAULT_SEED_BYTES, RunConfig, Store, generate_seed,
-    hash_wasm_file, run_wasm, seed_from_hex, verify_wasm,
+    DEFAULT_FUEL, DEFAULT_MEMORY_BYTES, DEFAULT_SAVE_FUEL_INTERVAL, DEFAULT_SEED_BYTES, RunConfig,
+    RunSession, Store, generate_seed, hash_wasm_file, seed_from_hex, verify_wasm,
 };
 
 const DEFAULT_RUN_COUNT: usize = 1;
@@ -52,6 +52,10 @@ enum Command {
         /// Fuel to assign to the wasmi store.
         #[arg(long, default_value_t = DEFAULT_FUEL)]
         fuel: u64,
+
+        /// Persist HLL progress after this much guest fuel is consumed.
+        #[arg(long, default_value_t = DEFAULT_SAVE_FUEL_INTERVAL)]
+        save_fuel_interval: u64,
 
         /// Maximum bytes for each guest linear memory.
         #[arg(long, default_value_t = DEFAULT_MEMORY_BYTES)]
@@ -100,6 +104,7 @@ fn main() -> Result<()> {
             count,
             store,
             fuel,
+            save_fuel_interval,
             memory_bytes,
             invoke,
         } => {
@@ -109,28 +114,43 @@ fn main() -> Result<()> {
             if seed.is_some() && count != 1 {
                 anyhow::bail!("--seed can only be used when --count=1");
             }
+            if save_fuel_interval == 0 {
+                anyhow::bail!("--save-fuel-interval must be greater than zero");
+            }
             let config = RunConfig {
                 fuel,
                 memory_bytes,
                 invoke,
             };
-            let program_hash = hash_wasm_file(&wasm)
-                .with_context(|| format!("failed to hash {}", wasm.display()))?;
-            let proven_before = Store::new(&store)
-                .stats(&program_hash)
-                .with_context(|| format!("failed to load HLL record for {program_hash}"))?
-                .estimated_observations;
+            let explicit_seed = match seed.as_deref() {
+                Some(seed) => Some(
+                    seed_from_hex(seed)
+                        .with_context(|| format!("failed to parse seed `{seed}`"))?,
+                ),
+                None => None,
+            };
+            let mut session = RunSession::from_wasm_path(&wasm, &store, config)
+                .with_context(|| format!("failed to prepare {}", wasm.display()))?;
+            let proven_before = session.stats().estimated_observations;
             let mut progress = ProgressDisplay::start(proven_before, io::stderr().is_terminal());
             for _ in 0..count {
-                let seed = match seed.as_ref() {
-                    Some(seed) => seed_from_hex(seed)
-                        .with_context(|| format!("failed to parse seed `{seed}`"))?,
+                let seed = match explicit_seed.as_ref() {
+                    Some(seed) => seed.clone(),
                     None => generate_seed(seed_bytes)?,
                 };
-                let result = run_wasm(&wasm, seed, &store, config.clone())
+                let result = session
+                    .run(seed)
                     .with_context(|| format!("failed to run {}", wasm.display()))?;
+                session
+                    .save_after_fuel(save_fuel_interval)
+                    .with_context(|| {
+                        format!("failed to save HLL record for {}", session.program_hash())
+                    })?;
                 progress.update(result.estimated_observations)?;
             }
+            session.save_pending().with_context(|| {
+                format!("failed to save HLL record for {}", session.program_hash())
+            })?;
             progress.finish()?;
         }
         Command::Stats {
