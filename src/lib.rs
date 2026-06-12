@@ -186,7 +186,7 @@ impl HllRecord {
         }
     }
 
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         if self.schema_version != SCHEMA_VERSION {
             bail!("unsupported HLL schema version {}", self.schema_version);
         }
@@ -435,7 +435,10 @@ pub fn observation_hash(observation: &Observation) -> String {
     update_hash_field(&mut hasher, observation.status.to_string().as_bytes());
     update_hash_field(&mut hasher, &observation.fuel_consumed.to_le_bytes());
     update_hash_field(&mut hasher, &observation.config.fuel.to_le_bytes());
-    update_hash_field(&mut hasher, &observation.config.memory_bytes.to_le_bytes());
+    update_hash_field(
+        &mut hasher,
+        &(observation.config.memory_bytes as u64).to_le_bytes(),
+    );
     update_hash_field(
         &mut hasher,
         observation
@@ -564,6 +567,10 @@ impl RunSession {
 
     pub fn stats(&self) -> HllStats {
         self.record.stats()
+    }
+
+    pub fn record(&self) -> &HllRecord {
+        &self.record
     }
 
     pub fn run(&mut self, seed: Vec<u8>) -> Result<RunResult> {

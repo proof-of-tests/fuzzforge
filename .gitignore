@@ -16,6 +16,14 @@ target
 # FuzzForge local runtime data
 .fuzzforge/
 
+# Node and Cloudflare local state
+node_modules/
+.wrangler/
+.env
+.dev.vars
+worker/generated/
+worker/verifier/target/
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore

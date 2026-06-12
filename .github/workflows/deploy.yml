@@ -1,0 +1,76 @@
+name: Deploy Worker
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - run: npm ci
+      - run: npm run build:verifier
+      - name: Build deploy config
+        env:
+          CLOUDFLARE_D1_DATABASE_ID: ${{ vars.CLOUDFLARE_D1_DATABASE_ID }}
+          CLOUDFLARE_D1_DATABASE_NAME: ${{ vars.CLOUDFLARE_D1_DATABASE_NAME }}
+          CLOUDFLARE_R2_BUCKET_NAME: ${{ vars.CLOUDFLARE_R2_BUCKET_NAME }}
+          CLOUDFLARE_WORKER_DOMAIN: ${{ vars.CLOUDFLARE_WORKER_DOMAIN }}
+          CLOUDFLARE_WORKER_NAME: ${{ vars.CLOUDFLARE_WORKER_NAME }}
+          CLOUDFLARE_WORKER_ZONE_NAME: ${{ vars.CLOUDFLARE_WORKER_ZONE_NAME }}
+        run: |
+          set -eu
+          : "${CLOUDFLARE_D1_DATABASE_ID:?CLOUDFLARE_D1_DATABASE_ID is required}"
+          CLOUDFLARE_D1_DATABASE_NAME="${CLOUDFLARE_D1_DATABASE_NAME:-fuzzforge}"
+          CLOUDFLARE_R2_BUCKET_NAME="${CLOUDFLARE_R2_BUCKET_NAME:-fuzzforge-wasm}"
+          CLOUDFLARE_WORKER_DOMAIN="${CLOUDFLARE_WORKER_DOMAIN:-fuzzforge.lemmih.com}"
+          CLOUDFLARE_WORKER_NAME="${CLOUDFLARE_WORKER_NAME:-fuzzforge-api}"
+          CLOUDFLARE_WORKER_ZONE_NAME="${CLOUDFLARE_WORKER_ZONE_NAME:-lemmih.com}"
+          cat > wrangler.deploy.toml <<EOF
+          name = "${CLOUDFLARE_WORKER_NAME}"
+          main = "worker/src/index.ts"
+          compatibility_date = "2025-09-06"
+
+          [[d1_databases]]
+          binding = "DB"
+          database_name = "${CLOUDFLARE_D1_DATABASE_NAME}"
+          database_id = "${CLOUDFLARE_D1_DATABASE_ID}"
+          migrations_dir = "worker/migrations"
+
+          [[r2_buckets]]
+          binding = "WASM_BUCKET"
+          bucket_name = "${CLOUDFLARE_R2_BUCKET_NAME}"
+
+          [[routes]]
+          pattern = "${CLOUDFLARE_WORKER_DOMAIN}"
+          custom_domain = true
+          zone_name = "${CLOUDFLARE_WORKER_ZONE_NAME}"
+
+          [[rules]]
+          type = "CompiledWasm"
+          globs = ["**/*.wasm"]
+          EOF
+      - name: Apply D1 migrations
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_D1_DATABASE_NAME: ${{ vars.CLOUDFLARE_D1_DATABASE_NAME }}
+        run: |
+          set -eu
+          npx wrangler d1 migrations apply "${CLOUDFLARE_D1_DATABASE_NAME:-fuzzforge}" --remote --config wrangler.deploy.toml
+      - name: Deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx wrangler deploy --config wrangler.deploy.toml
