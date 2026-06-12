@@ -132,9 +132,9 @@ npx wrangler r2 bucket create fuzzforge-wasm
 ```
 
 Put the returned D1 database id into the GitHub repository variable
-`CLOUDFLARE_D1_DATABASE_ID`. Deployment also requires `CLOUDFLARE_API_TOKEN`
-and `CLOUDFLARE_ACCOUNT_ID` secrets. Optional repository variables override
-defaults:
+`CLOUDFLARE_D1_DATABASE_ID`. Deployment also requires the
+`CLOUDFLARE_API_TOKEN` secret and the `CLOUDFLARE_ACCOUNT_ID` repository
+variable. Optional repository variables override defaults:
 
 - `CLOUDFLARE_D1_DATABASE_NAME` defaults to `fuzzforge`
 - `CLOUDFLARE_R2_BUCKET_NAME` defaults to `fuzzforge-wasm`
