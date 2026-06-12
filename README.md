@@ -13,6 +13,9 @@ cargo run -- run ./test.wasm --seed 68656c6c6f
 cargo run -- stats ./test.wasm
 cargo run -- verify ./test.wasm
 cargo run -- list
+cargo run -- run ./test.wasm --count=100 --submit-url
+cargo run -- submit ./test.wasm
+cargo run -- rate
 ```
 
 The `run` command sends a seed to the guest as stdin. If `--seed <hex>` is not
@@ -26,6 +29,15 @@ terminal, the progress line includes a spinner while a run is executing.
 For multi-run batches, fuzzforge keeps the compiled WASM module and HLL record
 in memory, then persists progress after `--save-fuel-interval` guest fuel has
 been consumed and once more at the end of the batch.
+
+Use `--submit-url <url>` on `run` to upload the WASM module and updated HLL
+proof after the batch finishes. Use `--submit-url` without a value to upload to
+the public FuzzForge API at `https://fuzzforge.lemmih.com`. You can also submit
+an existing local proof with `fuzzforge submit <wasm>`. If `--api-url` is omitted
+for network commands, fuzzforge reads `FUZZFORGE_API_URL` and otherwise defaults
+to `https://fuzzforge.lemmih.com`. Submitted proofs must use the current
+verifier version settings. Version 1 uses the default `fuel`, `memory_bytes`,
+and `_start` invocation.
 
 ## Example WASI Program
 
@@ -83,3 +95,54 @@ The HLL precision is fixed at `p = 6`, which means `2^6 = 64` buckets. This is
 intentionally compact and coarse, with an expected relative error of roughly 13%.
 The sketch implementation is maintained in this crate instead of depending on
 an external HyperLogLog package.
+
+## Cloudflare Backend
+
+The Worker API lives in `worker/src/index.ts` and uses:
+
+- R2 for `PUT/GET /api/programs/:program_hash/wasm`
+- D1 for `POST/GET /api/programs/:program_hash/proof`
+- bounded D1 HLL bucket witnesses for `GET /api/hash-results`
+- Server-sent events for `GET /api/hash-results/stream`
+
+Uploads are treated as untrusted input. The Worker verifies that uploaded WASM
+bytes match the requested program hash before storing them. Proof uploads are
+verified inside the Worker with a Rust/wasmi verifier compiled to WASM: each
+submitted observation is rerun against the stored WASM, and only newly verified
+observations are merged into the server-owned HLL buckets. The uploaded sketch
+is never accepted as the canonical aggregate. Anyone can upload WASM files and
+hash results as long as they are valid.
+
+D1 storage is bounded by the number of proven WASM programs. There is no D1
+program metadata table; WASM bytes live in R2 at the deterministic content-hash
+key. D1 stores at most `2^6 = 64` HLL bucket witness rows per program, and no
+separate proof counter rows. Each witness stores only the verifier version,
+seed, and observation hash; runtime settings are determined by the verifier
+version, not by submitters. Concurrent proof submissions update bucket rows with
+SQL upserts that keep the smallest verified observation hash for that bucket,
+which is equivalent to the highest HLL rank. The rank is derived when a proof is
+read; it is not stored. The live counter is derived by summing current HLL
+estimates.
+
+Create the Cloudflare resources once:
+
+```sh
+npx wrangler d1 create fuzzforge
+npx wrangler r2 bucket create fuzzforge-wasm
+```
+
+Put the returned D1 database id into the GitHub repository variable
+`CLOUDFLARE_D1_DATABASE_ID`. Deployment also requires `CLOUDFLARE_API_TOKEN`
+and `CLOUDFLARE_ACCOUNT_ID` secrets. Optional repository variables override
+defaults:
+
+- `CLOUDFLARE_D1_DATABASE_NAME` defaults to `fuzzforge`
+- `CLOUDFLARE_R2_BUCKET_NAME` defaults to `fuzzforge-wasm`
+- `CLOUDFLARE_WORKER_NAME` defaults to `fuzzforge-api`
+- `CLOUDFLARE_WORKER_DOMAIN` defaults to `fuzzforge.lemmih.com`
+- `CLOUDFLARE_WORKER_ZONE_NAME` defaults to `lemmih.com`
+
+CI runs Rust integration tests and Worker end-to-end tests on pull requests and
+pushes to `main`. Pushes to `main` also apply D1 migrations and deploy the
+Worker to the custom domain. The Worker owns the full hostname so the API and
+future website can be served from the same origin.

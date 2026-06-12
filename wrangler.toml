@@ -1,0 +1,22 @@
+name = "fuzzforge-api"
+main = "worker/src/index.ts"
+compatibility_date = "2025-09-06"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "fuzzforge"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "worker/migrations"
+
+[[r2_buckets]]
+binding = "WASM_BUCKET"
+bucket_name = "fuzzforge-wasm"
+
+[[routes]]
+pattern = "fuzzforge.lemmih.com"
+custom_domain = true
+zone_name = "lemmih.com"
+
+[[rules]]
+type = "CompiledWasm"
+globs = ["**/*.wasm"]
