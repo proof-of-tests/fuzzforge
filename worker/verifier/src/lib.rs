@@ -62,18 +62,13 @@ pub struct HllRecord {
     pub schema_version: u32,
     pub program_hash: String,
     pub precision: u8,
-    pub sketch: Sketch,
-    pub observations: Vec<StoredObservation>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct Sketch {
-    registers: Vec<u8>,
+    pub buckets: Vec<Option<StoredObservation>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredObservation {
     pub seed_hex: String,
+    pub verifier_version: u32,
     pub observation_hash: String,
 }
 
@@ -190,8 +185,8 @@ fn verify(wasm: &[u8], record_json: &[u8]) -> Result<(), i32> {
         serde_json::from_slice(record_json).map_err(|_| VERIFY_INVALID_RECORD)?;
     if record.schema_version != 2
         || record.precision != HLL_PRECISION
-        || record.sketch.registers.len() != HLL_BUCKETS
-        || record.observations.is_empty()
+        || record.buckets.len() != HLL_BUCKETS
+        || record.buckets.iter().all(Option::is_none)
     {
         return Err(VERIFY_INVALID_RECORD);
     }
@@ -201,7 +196,13 @@ fn verify(wasm: &[u8], record_json: &[u8]) -> Result<(), i32> {
         return Err(VERIFY_WASM_MISMATCH);
     }
 
-    for expected in &record.observations {
+    for (bucket, expected) in record.buckets.iter().enumerate() {
+        let Some(expected) = expected else {
+            continue;
+        };
+        if observation_bucket(&expected.observation_hash)? != bucket {
+            return Err(VERIFY_INVALID_RECORD);
+        }
         verify_observation(&program, &record.program_hash, expected)?;
     }
     Ok(())
@@ -325,23 +326,24 @@ fn verify_observation(
     expected: &StoredObservation,
 ) -> Result<(), i32> {
     let seed = seed_from_hex(&expected.seed_hex).ok_or(VERIFY_INVALID_RECORD)?;
-    for version in SUPPORTED_VERIFIER_VERSIONS {
-        let config = verifier_version_config(version);
-        let output = program
-            .execute(seed.clone(), config.clone())
-            .map_err(|_| VERIFY_OBSERVATION_MISMATCH)?;
-        let stdout_hash = hash_bytes_hex(&output.stdout);
-        let actual = StoredObservation::from_observation(Observation {
-            program_hash: program_hash.to_owned(),
-            seed_hex: expected.seed_hex.clone(),
-            stdout_hash,
-            status: output.status,
-            fuel_consumed: output.fuel_consumed,
-            config,
-        });
-        if actual.observation_hash == expected.observation_hash {
-            return Ok(());
-        }
+    if !SUPPORTED_VERIFIER_VERSIONS.contains(&expected.verifier_version) {
+        return Err(VERIFY_INVALID_RECORD);
+    }
+    let config = verifier_version_config(expected.verifier_version);
+    let output = program
+        .execute(seed, config.clone())
+        .map_err(|_| VERIFY_OBSERVATION_MISMATCH)?;
+    let stdout_hash = hash_bytes_hex(&output.stdout);
+    let actual = StoredObservation::from_observation(Observation {
+        program_hash: program_hash.to_owned(),
+        seed_hex: expected.seed_hex.clone(),
+        stdout_hash,
+        status: output.status,
+        fuel_consumed: output.fuel_consumed,
+        config,
+    });
+    if actual.observation_hash == expected.observation_hash {
+        return Ok(());
     }
     Err(VERIFY_HASH_MISMATCH)
 }
@@ -362,6 +364,7 @@ impl StoredObservation {
         let observation_hash = observation_hash(&observation);
         Self {
             seed_hex: observation.seed_hex,
+            verifier_version: 1,
             observation_hash,
         }
     }
@@ -619,7 +622,6 @@ fn observation_hash(observation: &Observation) -> String {
     update_hash_field(&mut hasher, observation.seed_hex.as_bytes());
     update_hash_field(&mut hasher, observation.stdout_hash.as_bytes());
     update_hash_field(&mut hasher, observation.status.to_string().as_bytes());
-    update_hash_field(&mut hasher, &observation.fuel_consumed.to_le_bytes());
     update_hash_field(&mut hasher, &observation.config.fuel.to_le_bytes());
     update_hash_field(
         &mut hasher,
@@ -657,6 +659,18 @@ fn seed_from_hex(seed_hex: &str) -> Option<Vec<u8>> {
         bytes.push((high << 4) | low);
     }
     Some(bytes)
+}
+
+fn observation_bucket(observation_hash: &str) -> Result<usize, i32> {
+    if observation_hash.len() != 64 {
+        return Err(VERIFY_INVALID_RECORD);
+    }
+    let mut value = 0u64;
+    for (shift, byte) in observation_hash.as_bytes().iter().take(16).enumerate() {
+        let digit = hex_digit(*byte).ok_or(VERIFY_INVALID_RECORD)?;
+        value |= u64::from(digit) << ((15 - shift) * 4);
+    }
+    Ok((value >> (u64::BITS - u32::from(HLL_PRECISION))) as usize)
 }
 
 fn hex_digit(byte: u8) -> Option<u8> {

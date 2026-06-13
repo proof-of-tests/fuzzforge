@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs,
     io::{self, IsTerminal, Write},
     path::PathBuf,
@@ -14,9 +15,9 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use fuzzforge::{
-    DEFAULT_FUEL, DEFAULT_MEMORY_BYTES, DEFAULT_SAVE_FUEL_INTERVAL, DEFAULT_SEED_BYTES, HllRecord,
-    RunConfig, RunSession, Store, generate_seed, hash_wasm_file, query_wasm_metadata,
-    seed_from_hex, verify_wasm,
+    DEFAULT_FUEL, DEFAULT_MEMORY_BYTES, DEFAULT_SAVE_FUEL_INTERVAL, DEFAULT_SEED_BYTES,
+    HLL_PRECISION, HllRecord, RunConfig, RunSession, Store, StoredObservation, generate_seed,
+    hash_bytes_hex, hash_wasm_file, query_wasm_metadata, seed_from_hex, verify_wasm,
 };
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,8 @@ use serde::{Deserialize, Serialize};
 const DEFAULT_RUN_COUNT: usize = 1;
 const DEFAULT_SUBMIT_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_RATE_WINDOW_SECONDS: u64 = 10;
+const DEFAULT_CORPUS_FUEL_BUDGET: u64 = 10_000_000_000;
+const PROGRAM_LIST_PAGE_SIZE: usize = 100;
 const API_URL_ENV: &str = "FUZZFORGE_API_URL";
 const DEFAULT_API_URL: &str = "https://fuzzforge.lemmih.com";
 
@@ -129,6 +132,21 @@ enum Command {
         api_url: Option<String>,
 
         /// HTTP timeout for proof submission.
+        #[arg(long, default_value_t = DEFAULT_SUBMIT_TIMEOUT_SECONDS)]
+        timeout_seconds: u64,
+    },
+
+    /// Continuously run every repository-associated WASM program from a fuzzforge API.
+    Corpus {
+        /// FuzzForge API base URL. Defaults to FUZZFORGE_API_URL or the public FuzzForge API.
+        #[arg(long)]
+        api_url: Option<String>,
+
+        /// Guest fuel to spend on each program before moving to the next one.
+        #[arg(long, default_value_t = DEFAULT_CORPUS_FUEL_BUDGET)]
+        fuel_budget: u64,
+
+        /// HTTP timeout for program downloads and proof submissions.
         #[arg(long, default_value_t = DEFAULT_SUBMIT_TIMEOUT_SECONDS)]
         timeout_seconds: u64,
     },
@@ -321,6 +339,20 @@ fn main() -> Result<()> {
                 Duration::from_secs(timeout_seconds),
             )?;
         }
+        Command::Corpus {
+            api_url,
+            fuel_budget,
+            timeout_seconds,
+        } => {
+            if fuel_budget == 0 {
+                anyhow::bail!("--fuel-budget must be greater than zero");
+            }
+            if timeout_seconds == 0 {
+                anyhow::bail!("--timeout-seconds must be greater than zero");
+            }
+            let api_url = api_url_or_env(api_url)?;
+            run_corpus(&api_url, fuel_budget, Duration::from_secs(timeout_seconds))?;
+        }
         Command::Rate {
             api_url,
             window_seconds,
@@ -333,6 +365,310 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn run_corpus(api_url: &str, fuel_budget: u64, timeout: Duration) -> Result<()> {
+    let client = Client::builder()
+        .timeout(timeout)
+        .build()
+        .context("failed to build HTTP client")?;
+    let cache_dir = wasm_cache_dir()?;
+    let mut completed_passes = 0usize;
+    loop {
+        let programs = list_associated_programs(&client, api_url)?;
+        eprintln!(
+            "corpus_pass={} associated_programs={}",
+            completed_passes + 1,
+            programs.len()
+        );
+        for program in programs {
+            match load_cached_associated_program(&client, api_url, &cache_dir, program) {
+                Ok(Some(download)) => run_corpus_program(api_url, &client, &download, fuel_budget)
+                    .with_context(|| format!("failed to run {}", download.program.program_hash))?,
+                Ok(None) => {}
+                Err(error) => eprintln!("download_error={error:#}"),
+            }
+        }
+        completed_passes = completed_passes.saturating_add(1);
+    }
+}
+
+fn list_associated_programs(client: &Client, api_url: &str) -> Result<Vec<ProgramSummary>> {
+    let base = api_url.trim_end_matches('/');
+    let mut cursor: Option<String> = None;
+    let mut programs = Vec::new();
+    loop {
+        let mut url = format!(
+            "{base}/api/programs?associated=true&limit={}",
+            PROGRAM_LIST_PAGE_SIZE
+        );
+        if let Some(cursor) = &cursor {
+            url.push_str("&cursor=");
+            url.push_str(cursor);
+        }
+        let response = client
+            .get(&url)
+            .send()
+            .with_context(|| format!("failed to list programs from {url}"))?;
+        ensure_success_ref(&response, "program listing")?;
+        let page: ProgramListResponse = response.json().context("failed to parse program list")?;
+        programs.extend(page.programs);
+        match page.next_cursor {
+            Some(next_cursor) => cursor = Some(next_cursor),
+            None => return Ok(programs),
+        }
+    }
+}
+
+fn load_cached_associated_program(
+    client: &Client,
+    api_url: &str,
+    cache_dir: &PathBuf,
+    program: ProgramSummary,
+) -> Result<Option<CorpusDownload>> {
+    let wasm_path = cache_dir.join(format!("{}.wasm", program.program_hash));
+    let wasm = match fs::read(&wasm_path) {
+        Ok(wasm) => wasm,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            download_wasm_to_cache(client, api_url, cache_dir, &program)?
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", wasm_path.display()));
+        }
+    };
+
+    let actual_hash = hash_bytes_hex(&wasm);
+    if actual_hash == program.program_hash {
+        return validate_cached_associated_program(program, wasm);
+    }
+
+    eprintln!(
+        "cache_hash_mismatch={} path={}",
+        program.program_hash,
+        wasm_path.display()
+    );
+    let wasm = download_wasm_to_cache(client, api_url, cache_dir, &program)?;
+    validate_cached_associated_program(program, wasm)
+}
+
+fn download_wasm_to_cache(
+    client: &Client,
+    api_url: &str,
+    cache_dir: &PathBuf,
+    program: &ProgramSummary,
+) -> Result<Vec<u8>> {
+    let base = api_url.trim_end_matches('/');
+    let wasm_url = format!("{base}/api/programs/{}/wasm", program.program_hash);
+    let response = client
+        .get(&wasm_url)
+        .send()
+        .with_context(|| format!("failed to download WASM from {wasm_url}"))?;
+    ensure_success_ref(&response, "WASM download")?;
+    let wasm = response.bytes().context("failed to read WASM download")?;
+    let actual_hash = hash_bytes_hex(&wasm);
+    if actual_hash != program.program_hash {
+        anyhow::bail!(
+            "downloaded WASM hash mismatch: expected {}, got {}",
+            program.program_hash,
+            actual_hash
+        );
+    }
+    fs::create_dir_all(cache_dir)
+        .with_context(|| format!("failed to create {}", cache_dir.display()))?;
+    let wasm_path = cache_dir.join(format!("{}.wasm", program.program_hash));
+    let tmp = wasm_path.with_extension(format!("wasm.tmp.{}", std::process::id()));
+    fs::write(&tmp, &wasm).with_context(|| format!("failed to write {}", tmp.display()))?;
+    fs::rename(&tmp, &wasm_path).with_context(|| {
+        format!(
+            "failed to rename {} to {}",
+            tmp.display(),
+            wasm_path.display()
+        )
+    })?;
+    Ok(wasm.to_vec())
+}
+
+fn validate_cached_associated_program(
+    program: ProgramSummary,
+    wasm: Vec<u8>,
+) -> Result<Option<CorpusDownload>> {
+    let metadata =
+        query_wasm_metadata(&wasm).context("failed to query downloaded WASM metadata")?;
+    if metadata
+        .and_then(|metadata| metadata.github_repository)
+        .is_none()
+    {
+        eprintln!("skipped_unassociated={}", program.program_hash);
+        return Ok(None);
+    }
+    Ok(Some(CorpusDownload { program, wasm }))
+}
+
+fn run_corpus_program(
+    api_url: &str,
+    client: &Client,
+    download: &CorpusDownload,
+    fuel_budget: u64,
+) -> Result<()> {
+    let CentralState {
+        record: initial_record,
+        mut bucket_witnesses,
+    } = fetch_central_state(client, api_url, &download.program.program_hash)?;
+    let mut session = RunSession::from_wasm_bytes_with_record(
+        &download.wasm,
+        initial_record,
+        RunConfig::default(),
+    )
+    .with_context(|| format!("failed to prepare {}", download.program.program_hash))?;
+    let mut fuel_spent = 0u64;
+    let mut uploaded_observations = 0u64;
+    let mut skipped_observations = 0u64;
+    eprintln!(
+        "program_start={} repository={} fuel_budget={} initial_estimate={:.3}",
+        download.program.program_hash,
+        download.program.github_repository.as_deref().unwrap_or("-"),
+        fuel_budget,
+        session.stats().estimated_observations
+    );
+    while fuel_spent < fuel_budget {
+        let result = session
+            .run(generate_seed(DEFAULT_SEED_BYTES)?)
+            .with_context(|| format!("failed to run {}", download.program.program_hash))?;
+        fuel_spent = fuel_spent.saturating_add(result.fuel_consumed);
+        let proof = single_observation_record(
+            session.program_hash(),
+            result.seed_hex.clone(),
+            result.observation_hash.clone(),
+        )?;
+        let observation_hash = &result.observation_hash;
+        let bucket = observation_bucket(observation_hash)?;
+        if bucket_witnesses
+            .get(&bucket)
+            .is_some_and(|previous| observation_hash >= previous)
+        {
+            skipped_observations = skipped_observations.saturating_add(1);
+        } else {
+            submit_proof_record(client, api_url, &proof)?;
+            bucket_witnesses.insert(bucket, observation_hash.clone());
+            uploaded_observations = uploaded_observations.saturating_add(1);
+        }
+        if result.fuel_consumed == 0 {
+            eprintln!("program_zero_fuel={}", session.program_hash());
+            break;
+        }
+    }
+    eprintln!(
+        "program_done={} fuel_spent={} uploaded_observations={} skipped_observations={} estimated_observations={:.3}",
+        session.program_hash(),
+        fuel_spent,
+        uploaded_observations,
+        skipped_observations,
+        session.stats().estimated_observations
+    );
+    Ok(())
+}
+
+fn fetch_central_state(client: &Client, api_url: &str, program_hash: &str) -> Result<CentralState> {
+    let proof_url = format!(
+        "{}/api/programs/{program_hash}/proof",
+        api_url.trim_end_matches('/')
+    );
+    let response = client
+        .get(&proof_url)
+        .send()
+        .with_context(|| format!("failed to fetch central proof from {proof_url}"))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(CentralState {
+            record: HllRecord::new(program_hash.to_owned()),
+            bucket_witnesses: HashMap::new(),
+        });
+    }
+    ensure_success_ref(&response, "central proof fetch")?;
+    let proof: CentralProof = response.json().context("failed to parse central proof")?;
+    if proof.program_hash != program_hash {
+        anyhow::bail!(
+            "central proof hash mismatch: expected {}, got {}",
+            program_hash,
+            proof.program_hash
+        );
+    }
+    if proof.schema_version != 2 {
+        anyhow::bail!("unsupported central proof schema {}", proof.schema_version);
+    }
+    if proof.precision != 6 {
+        anyhow::bail!("unsupported central proof precision {}", proof.precision);
+    }
+    let mut bucket_witnesses = HashMap::new();
+    for observation in proof.buckets.iter().filter_map(Option::as_ref) {
+        let bucket = observation_bucket(&observation.observation_hash)?;
+        match bucket_witnesses.get(&bucket) {
+            Some(previous) if previous <= &observation.observation_hash => {}
+            _ => {
+                bucket_witnesses.insert(bucket, observation.observation_hash.clone());
+            }
+        }
+    }
+    let record = HllRecord {
+        schema_version: proof.schema_version,
+        program_hash: proof.program_hash,
+        precision: proof.precision,
+        buckets: proof.buckets,
+    };
+    record.validate()?;
+    Ok(CentralState {
+        record,
+        bucket_witnesses,
+    })
+}
+
+fn single_observation_record(
+    program_hash: &str,
+    seed_hex: String,
+    observation_hash: String,
+) -> Result<HllRecord> {
+    let observation = StoredObservation {
+        seed_hex,
+        verifier_version: 1,
+        observation_hash,
+    };
+    let mut proof = HllRecord::new(program_hash.to_owned());
+    proof.insert_observation(observation)?;
+    Ok(proof)
+}
+
+fn submit_proof_record(client: &Client, api_url: &str, record: &HllRecord) -> Result<()> {
+    record.validate()?;
+    ensure_submit_record_uses_current_verifier(record)?;
+    let proof_url = format!(
+        "{}/api/programs/{}/proof",
+        api_url.trim_end_matches('/'),
+        record.program_hash
+    );
+    let response = client
+        .post(&proof_url)
+        .json(record)
+        .send()
+        .with_context(|| format!("failed to submit proof to {proof_url}"))?;
+    ensure_success(response, "proof submission")?;
+    println!(
+        "submitted_observation={} stored_observations={}",
+        record.program_hash,
+        record.bucket_witnesses().count()
+    );
+    Ok(())
+}
+
+fn observation_bucket(observation_hash: &str) -> Result<usize> {
+    if observation_hash.len() < 16
+        || !observation_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        anyhow::bail!("invalid observation hash `{observation_hash}`");
+    }
+    let value = u64::from_str_radix(&observation_hash[..16], 16)
+        .with_context(|| format!("failed to parse observation hash `{observation_hash}`"))?;
+    Ok((value >> (u64::BITS - u32::from(HLL_PRECISION))) as usize)
 }
 
 fn api_url_or_env(api_url: Option<String>) -> Result<String> {
@@ -480,24 +816,23 @@ fn submit_proof(
     println!(
         "submitted_proof={} stored_observations={}",
         record.program_hash,
-        record.observations.len()
+        record.bucket_witnesses().count()
     );
     Ok(())
 }
 
 fn ensure_submit_record_uses_current_verifier(record: &HllRecord) -> Result<()> {
-    let expected = RunConfig::default();
-    for observation in &record.observations {
-        if observation.config != expected {
+    for observation in record.bucket_witnesses() {
+        if observation.verifier_version != 1 {
             anyhow::bail!(
-                "proof submission requires verifier version 1 settings; observation seed {} used a custom config",
-                observation.seed_hex
+                "proof submission requires verifier version 1 settings; observation seed {} used verifier version {}",
+                observation.seed_hex,
+                observation.verifier_version
             );
         }
     }
     Ok(())
 }
-
 fn ensure_success(response: reqwest::blocking::Response, action: &str) -> Result<()> {
     if response.status().is_success() {
         return Ok(());
@@ -554,6 +889,17 @@ fn github_token_path() -> Result<PathBuf> {
     Ok(config_home.join("fuzzforge").join("github.json"))
 }
 
+fn wasm_cache_dir() -> Result<PathBuf> {
+    let cache_home = match std::env::var_os("XDG_CACHE_HOME") {
+        Some(value) => PathBuf::from(value),
+        None => std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(".cache"))
+            .context("HOME is not set; cannot locate WASM cache directory")?,
+    };
+    Ok(cache_home.join("fuzzforge").join("wasm"))
+}
+
 fn unix_now() -> Result<u64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -586,6 +932,36 @@ struct GitHubTokenResponse {
 struct StoredGitHubToken {
     access_token: String,
     expires_at: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProgramListResponse {
+    programs: Vec<ProgramSummary>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProgramSummary {
+    program_hash: String,
+    github_repository: Option<String>,
+}
+
+struct CentralState {
+    record: HllRecord,
+    bucket_witnesses: HashMap<usize, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CentralProof {
+    schema_version: u32,
+    program_hash: String,
+    precision: u8,
+    buckets: Vec<Option<StoredObservation>>,
+}
+
+struct CorpusDownload {
+    program: ProgramSummary,
+    wasm: Vec<u8>,
 }
 
 fn watch_rate(api_url: &str, window: Duration) -> Result<()> {
