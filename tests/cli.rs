@@ -25,6 +25,36 @@ fn echo_wasm() -> Vec<u8> {
     .expect("valid wat")
 }
 
+fn associated_echo_wasm() -> Vec<u8> {
+    with_metadata_section(echo_wasm(), br#"{"github_repository":"owner/repo"}"#)
+}
+
+fn with_metadata_section(mut wasm: Vec<u8>, metadata: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    encode_leb_u32("fuzzforge.metadata".len() as u32, &mut payload);
+    payload.extend_from_slice(b"fuzzforge.metadata");
+    payload.extend_from_slice(metadata);
+
+    wasm.push(0);
+    encode_leb_u32(payload.len() as u32, &mut wasm);
+    wasm.extend_from_slice(&payload);
+    wasm
+}
+
+fn encode_leb_u32(mut value: u32, out: &mut Vec<u8>) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
 #[test]
 fn run_stats_and_list_persist_hll() {
     let temp = tempdir().expect("tempdir");
@@ -319,6 +349,11 @@ fn submit_uploads_wasm_and_proof() {
             tx.send((
                 request.method().as_str().to_owned(),
                 request.url().to_owned(),
+                request
+                    .headers()
+                    .iter()
+                    .find(|header| header.field.equiv("authorization"))
+                    .map(|header| header.value.as_str().to_owned()),
                 body,
             ))
             .expect("send request");
@@ -356,13 +391,132 @@ fn submit_uploads_wasm_and_proof() {
 
     assert_eq!(first.0, "PUT");
     assert_eq!(first.1, format!("/api/programs/{expected_hash}/wasm"));
-    assert_eq!(first.2, wasm);
+    assert_eq!(first.2, None);
+    assert_eq!(first.3, wasm);
 
     assert_eq!(second.0, "POST");
     assert_eq!(second.1, format!("/api/programs/{expected_hash}/proof"));
-    let proof: serde_json::Value = serde_json::from_slice(&second.2).expect("proof json");
+    assert_eq!(second.2, None);
+    let proof: serde_json::Value = serde_json::from_slice(&second.3).expect("proof json");
     assert_eq!(proof["program_hash"], expected_hash);
     assert_eq!(proof["observations"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn associated_submit_sends_stored_github_token() {
+    let temp = tempdir().expect("tempdir");
+    let wasm_path = temp.path().join("echo.wasm");
+    let store_path = temp.path().join("store");
+    let config_path = temp.path().join("config");
+    let wasm = associated_echo_wasm();
+    fs::write(&wasm_path, &wasm).expect("write wasm");
+    let token_dir = config_path.join("fuzzforge");
+    fs::create_dir_all(&token_dir).expect("create token dir");
+    fs::write(
+        token_dir.join("github.json"),
+        br#"{"access_token":"test-token","expires_at":4102444800}"#,
+    )
+    .expect("write token");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
+        .args([
+            "run",
+            wasm_path.to_str().unwrap(),
+            "--seed",
+            "7375626d6974",
+            "--store",
+            store_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run command");
+    assert!(run.status.success(), "stderr: {}", stderr(&run));
+
+    let server = tiny_http::Server::http("127.0.0.1:0").expect("server");
+    let api_url = format!("http://{}", server.server_addr());
+    let expected_hash = blake3::hash(&wasm).to_hex().to_string();
+    let (tx, rx) = mpsc::channel();
+    let server_thread = thread::spawn(move || {
+        for _ in 0..2 {
+            let mut request = server.recv().expect("request");
+            let mut body = Vec::new();
+            std::io::Read::read_to_end(request.as_reader(), &mut body).expect("body");
+            tx.send((
+                request.method().as_str().to_owned(),
+                request.url().to_owned(),
+                request
+                    .headers()
+                    .iter()
+                    .find(|header| header.field.equiv("authorization"))
+                    .map(|header| header.value.as_str().to_owned()),
+                body,
+            ))
+            .expect("send request");
+            request
+                .respond(tiny_http::Response::from_string("{}"))
+                .expect("respond");
+        }
+    });
+
+    let submit = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
+        .env("XDG_CONFIG_HOME", &config_path)
+        .args([
+            "submit",
+            wasm_path.to_str().unwrap(),
+            "--store",
+            store_path.to_str().unwrap(),
+            "--api-url",
+            &api_url,
+        ])
+        .output()
+        .expect("submit command");
+    assert!(submit.status.success(), "stderr: {}", stderr(&submit));
+
+    let first = rx.recv().expect("first request");
+    let second = rx.recv().expect("second request");
+    server_thread.join().expect("server thread");
+
+    assert_eq!(first.0, "PUT");
+    assert_eq!(first.1, format!("/api/programs/{expected_hash}/wasm"));
+    assert_eq!(first.2, Some("Bearer test-token".to_owned()));
+    assert_eq!(second.0, "POST");
+    assert_eq!(second.2, None);
+}
+
+#[test]
+fn associated_submit_without_token_fails_before_upload() {
+    let temp = tempdir().expect("tempdir");
+    let wasm_path = temp.path().join("echo.wasm");
+    let store_path = temp.path().join("store");
+    let config_path = temp.path().join("config");
+    fs::write(&wasm_path, associated_echo_wasm()).expect("write wasm");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
+        .args([
+            "run",
+            wasm_path.to_str().unwrap(),
+            "--seed",
+            "7375626d6974",
+            "--store",
+            store_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run command");
+    assert!(run.status.success(), "stderr: {}", stderr(&run));
+
+    let submit = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
+        .env("XDG_CONFIG_HOME", &config_path)
+        .args([
+            "submit",
+            wasm_path.to_str().unwrap(),
+            "--store",
+            store_path.to_str().unwrap(),
+            "--api-url",
+            "http://127.0.0.1:9",
+        ])
+        .output()
+        .expect("submit command");
+    assert!(!submit.status.success());
+    assert!(stderr(&submit).contains("fuzzforge auth login"));
 }
 
 fn stdout(output: &std::process::Output) -> String {

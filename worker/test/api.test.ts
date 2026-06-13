@@ -1,10 +1,15 @@
-import { SELF, env } from "cloudflare:test";
-import { beforeEach, describe, expect, test } from "vitest";
+import { SELF, env, fetchMock } from "cloudflare:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, test } from "vitest";
 
 const PROGRAM_HASH = "a2840b47184016de26d91be9d95955d962509723404cf60907961399ccfdf29f";
 const WASM_HEX =
   "0061736d0100000001040160000003020100070a01065f737461727400000a040102000b";
 const WASM = hexToBytes(WASM_HEX);
+const ASSOCIATED_PROGRAM_HASH =
+  "dd4ffef9a099126e58677d9f1a695d3072512cadedb5625441e8459d473fd1ef";
+const ASSOCIATED_WASM_HEX =
+  "0061736d0100000001040160000003020100070a01065f737461727400000a040102000b00351266757a7a666f7267652e6d657461646174617b226769746875625f7265706f7369746f7279223a226f776e65722f7265706f227d";
+const ASSOCIATED_WASM = hexToBytes(ASSOCIATED_WASM_HEX);
 const OBSERVATIONS = [
   {
     seed_hex: "00",
@@ -41,9 +46,20 @@ const SAME_BUCKET_HIGH_RANK = {
 };
 
 describe("fuzzforge worker api", () => {
+  beforeAll(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+  });
+
   beforeEach(async () => {
     await env.DB.prepare("DELETE FROM hll_buckets").run();
+    await env.DB.prepare("DELETE FROM programs").run();
     await env.WASM_BUCKET.delete(`wasm/${PROGRAM_HASH}.wasm`);
+    await env.WASM_BUCKET.delete(`wasm/${ASSOCIATED_PROGRAM_HASH}.wasm`);
+  });
+
+  afterEach(() => {
+    fetchMock.assertNoPendingInterceptors();
   });
 
   test("stores and fetches wasm from r2 after verifying its hash", async () => {
@@ -55,6 +71,25 @@ describe("fuzzforge worker api", () => {
     expect(get.headers.get("content-type")).toBe("application/wasm");
   });
 
+  test("returns program metadata for stored wasm", async () => {
+    await uploadWasm();
+
+    const get = await SELF.fetch(`https://example.com/api/programs/${PROGRAM_HASH}`);
+    expect(get.status).toBe(200);
+    await expect(get.json()).resolves.toMatchObject({
+      program_hash: PROGRAM_HASH,
+      github_repository: null,
+      github_verified_by: null,
+      wasm_bytes: WASM.byteLength,
+    });
+  });
+
+  test("returns github app client id for cli login", async () => {
+    const get = await SELF.fetch("https://example.com/api/auth/github");
+    expect(get.status).toBe(200);
+    await expect(get.json()).resolves.toEqual({ client_id: "test-client-id" });
+  });
+
   test("rejects wasm uploaded under the wrong hash", async () => {
     const put = await SELF.fetch(`https://example.com/api/programs/${"a".repeat(64)}/wasm`, {
       method: "PUT",
@@ -62,6 +97,125 @@ describe("fuzzforge worker api", () => {
     });
     expect(put.status).toBe(400);
     await expect(put.json()).resolves.toEqual({ error: "wasm_hash_mismatch" });
+  });
+
+  test("does not call github when associated wasm hash mismatches", async () => {
+    const put = await SELF.fetch(`https://example.com/api/programs/${"a".repeat(64)}/wasm`, {
+      method: "PUT",
+      body: ASSOCIATED_WASM,
+    });
+    expect(put.status).toBe(400);
+    await expect(put.json()).resolves.toEqual({ error: "wasm_hash_mismatch" });
+  });
+
+  test("rejects associated wasm without github auth", async () => {
+    const put = await SELF.fetch(
+      `https://example.com/api/programs/${ASSOCIATED_PROGRAM_HASH}/wasm`,
+      {
+        method: "PUT",
+        body: ASSOCIATED_WASM,
+      },
+    );
+    expect(put.status).toBe(401);
+    await expect(put.json()).resolves.toEqual({ error: "github_auth_required" });
+  });
+
+  test("rejects associated wasm with invalid github token", async () => {
+    mockGitHubUser(401, { message: "Bad credentials" });
+
+    const put = await SELF.fetch(
+      `https://example.com/api/programs/${ASSOCIATED_PROGRAM_HASH}/wasm`,
+      {
+        method: "PUT",
+        headers: { authorization: "Bearer bad-token" },
+        body: ASSOCIATED_WASM,
+      },
+    );
+    expect(put.status).toBe(401);
+    await expect(put.json()).resolves.toEqual({ error: "github_auth_invalid" });
+  });
+
+  test("rejects associated wasm when github permission is read", async () => {
+    mockGitHubPermission("read");
+
+    const put = await SELF.fetch(
+      `https://example.com/api/programs/${ASSOCIATED_PROGRAM_HASH}/wasm`,
+      {
+        method: "PUT",
+        headers: { authorization: "Bearer read-token" },
+        body: ASSOCIATED_WASM,
+      },
+    );
+    expect(put.status).toBe(403);
+    await expect(put.json()).resolves.toEqual({ error: "repository_access_denied" });
+  });
+
+  test("rejects associated wasm when github permission lookup returns 404", async () => {
+    mockGitHubUser(200, { login: "alice" });
+    mockGitHubPermissionResponse(404, { message: "Not Found" });
+
+    const put = await SELF.fetch(
+      `https://example.com/api/programs/${ASSOCIATED_PROGRAM_HASH}/wasm`,
+      {
+        method: "PUT",
+        headers: { authorization: "Bearer denied-token" },
+        body: ASSOCIATED_WASM,
+      },
+    );
+    expect(put.status).toBe(403);
+    await expect(put.json()).resolves.toEqual({ error: "repository_access_denied" });
+  });
+
+  test("stores associated wasm after verifying github write permission", async () => {
+    mockGitHubPermission("write");
+
+    const put = await SELF.fetch(
+      `https://example.com/api/programs/${ASSOCIATED_PROGRAM_HASH}/wasm`,
+      {
+        method: "PUT",
+        headers: { authorization: "Bearer write-token" },
+        body: ASSOCIATED_WASM,
+      },
+    );
+    expect(put.status, await put.clone().text()).toBe(200);
+    await expect(put.json()).resolves.toMatchObject({
+      program_hash: ASSOCIATED_PROGRAM_HASH,
+      bytes: ASSOCIATED_WASM.byteLength,
+      github_repository: "owner/repo",
+      github_verified_by: "alice",
+    });
+
+    const row = await env.DB.prepare(
+      "SELECT github_repository, github_verified_by, wasm_bytes FROM programs WHERE program_hash = ?",
+    )
+      .bind(ASSOCIATED_PROGRAM_HASH)
+      .first<{ github_repository: string; github_verified_by: string; wasm_bytes: number }>();
+    expect(row).toEqual({
+      github_repository: "owner/repo",
+      github_verified_by: "alice",
+      wasm_bytes: ASSOCIATED_WASM.byteLength,
+    });
+  });
+
+  test("rejects malformed wasm metadata", async () => {
+    const invalid = withMetadata(WASM, new Uint8Array([0xff]));
+    const put = await SELF.fetch(
+      "https://example.com/api/programs/70420d3bec5c2e28dc02689b899f36c7ac8c3889f0c2a9ea336eb9e898566000/wasm",
+      {
+        method: "PUT",
+        body: invalid,
+      },
+    );
+    expect(put.status).toBe(400);
+    await expect(put.json()).resolves.toEqual({ error: "invalid_wasm_metadata" });
+  });
+
+  test("allows authorization header in cors preflight", async () => {
+    const response = await SELF.fetch("https://example.com/api/programs", {
+      method: "OPTIONS",
+    });
+    expect(response.status).toBe(204);
+    expect(response.headers.get("access-control-allow-headers")).toContain("authorization");
   });
 
   test("verifies observations before merging them into the server proof", async () => {
@@ -236,4 +390,56 @@ function proofRecord(observations: unknown[]) {
 
 function hexToBytes(hex: string): Uint8Array {
   return new Uint8Array(hex.match(/.{2}/g)!.map((byte) => Number.parseInt(byte, 16)));
+}
+
+function mockGitHubPermission(permission: string) {
+  mockGitHubUser(200, { login: "alice" });
+  mockGitHubPermissionResponse(200, { permission });
+}
+
+function mockGitHubUser(status: number, body: object) {
+  fetchMock.get("https://api.github.com").intercept({ method: "GET", path: "/user" }).reply(
+    status,
+    body,
+    { headers: { "content-type": "application/json" } },
+  );
+}
+
+function mockGitHubPermissionResponse(status: number, body: object) {
+  fetchMock
+    .get("https://api.github.com")
+    .intercept({
+      method: "GET",
+      path: "/repos/owner/repo/collaborators/alice/permission",
+    })
+    .reply(status, body, { headers: { "content-type": "application/json" } });
+}
+
+function withMetadata(wasm: Uint8Array, metadata: Uint8Array): Uint8Array {
+  const name = new TextEncoder().encode("fuzzforge.metadata");
+  const payload = concat([encodeLebU32(name.byteLength), name, metadata]);
+  return concat([wasm, new Uint8Array([0]), encodeLebU32(payload.byteLength), payload]);
+}
+
+function encodeLebU32(value: number): Uint8Array {
+  const bytes = [];
+  do {
+    let byte = value & 0x7f;
+    value >>>= 7;
+    if (value !== 0) {
+      byte |= 0x80;
+    }
+    bytes.push(byte);
+  } while (value !== 0);
+  return new Uint8Array(bytes);
+}
+
+function concat(parts: Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(parts.reduce((sum, part) => sum + part.byteLength, 0));
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.byteLength;
+  }
+  return out;
 }

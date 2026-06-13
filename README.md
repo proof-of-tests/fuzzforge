@@ -13,6 +13,7 @@ cargo run -- run ./test.wasm --seed 68656c6c6f
 cargo run -- stats ./test.wasm
 cargo run -- verify ./test.wasm
 cargo run -- list
+cargo run -- auth login
 cargo run -- run ./test.wasm --count=100 --submit-url
 cargo run -- submit ./test.wasm
 cargo run -- rate
@@ -38,6 +39,20 @@ for network commands, fuzzforge reads `FUZZFORGE_API_URL` and otherwise defaults
 to `https://fuzzforge.lemmih.com`. Submitted proofs must use the current
 verifier version settings. Version 1 uses the default `fuel`, `memory_bytes`,
 and `_start` invocation.
+
+WASM modules can optionally associate themselves with a GitHub repository by
+including one `fuzzforge.metadata` custom section containing UTF-8 JSON:
+
+```json
+{"github_repository":"owner/repo"}
+```
+
+Unassociated WASM uploads do not require authentication. Associated uploads
+require a GitHub App user token for a user with write or admin access to the
+declared repository. Run `fuzzforge auth login` before submitting associated
+WASM. The CLI uses the GitHub App device flow and stores token data under
+`$XDG_CONFIG_HOME/fuzzforge/github.json`, or `$HOME/.config/fuzzforge/github.json`
+when `XDG_CONFIG_HOME` is not set.
 
 ## Example WASI Program
 
@@ -101,28 +116,32 @@ an external HyperLogLog package.
 The Worker API lives in `worker/src/index.ts` and uses:
 
 - R2 for `PUT/GET /api/programs/:program_hash/wasm`
+- D1 for `GET /api/programs/:program_hash` metadata
 - D1 for `POST/GET /api/programs/:program_hash/proof`
+- GitHub App user tokens for associated WASM upload authorization
 - bounded D1 HLL bucket witnesses for `GET /api/hash-results`
 - Server-sent events for `GET /api/hash-results/stream`
 
 Uploads are treated as untrusted input. The Worker verifies that uploaded WASM
-bytes match the requested program hash before storing them. Proof uploads are
-verified inside the Worker with a Rust/wasmi verifier compiled to WASM: each
-submitted observation is rerun against the stored WASM, and only newly verified
-observations are merged into the server-owned HLL buckets. The uploaded sketch
-is never accepted as the canonical aggregate. Anyone can upload WASM files and
-hash results as long as they are valid.
+bytes match the requested program hash before storing them. If the module has a
+`fuzzforge.metadata` custom section with `github_repository`, the Worker requires
+an `Authorization: Bearer <token>` header, checks `GET /user`, then checks
+`GET /repos/:owner/:repo/collaborators/:login/permission`, accepting only
+`write` or `admin`. Unassociated WASM uploads remain unauthenticated.
 
-D1 storage is bounded by the number of proven WASM programs. There is no D1
-program metadata table; WASM bytes live in R2 at the deterministic content-hash
-key. D1 stores at most `2^6 = 64` HLL bucket witness rows per program, and no
-separate proof counter rows. Each witness stores only the verifier version,
-seed, and observation hash; runtime settings are determined by the verifier
-version, not by submitters. Concurrent proof submissions update bucket rows with
-SQL upserts that keep the smallest verified observation hash for that bucket,
-which is equivalent to the highest HLL rank. The rank is derived when a proof is
-read; it is not stored. The live counter is derived by summing current HLL
-estimates.
+Proof uploads are verified inside the Worker with a Rust/wasmi verifier compiled
+to WASM: each submitted observation is rerun against the stored WASM, and only
+newly verified observations are merged into the server-owned HLL buckets. The
+uploaded sketch is never accepted as the canonical aggregate.
+
+D1 stores one program metadata row per uploaded WASM and at most `2^6 = 64` HLL
+bucket witness rows per program. WASM bytes live in R2 at the deterministic
+content-hash key. Each witness stores only the verifier version, seed, and
+observation hash; runtime settings are determined by the verifier version, not
+by submitters. Concurrent proof submissions update bucket rows with SQL upserts
+that keep the smallest verified observation hash for that bucket, which is
+equivalent to the highest HLL rank. The rank is derived when a proof is read; it
+is not stored. The live counter is derived by summing current HLL estimates.
 
 Create the Cloudflare resources once:
 
@@ -133,8 +152,10 @@ npx wrangler r2 bucket create fuzzforge-wasm
 
 Put the returned D1 database id into the GitHub repository variable
 `CLOUDFLARE_D1_DATABASE_ID`. Deployment also requires `CLOUDFLARE_API_TOKEN`
-and `CLOUDFLARE_ACCOUNT_ID` secrets. Optional repository variables override
-defaults:
+and `CLOUDFLARE_ACCOUNT_ID` secrets. Associated WASM uploads require a GitHub
+App with device flow enabled and repository metadata read permission. Set
+`GITHUB_APP_CLIENT_ID` as a Worker variable or secret so the CLI can start the
+device flow. Optional repository variables override defaults:
 
 - `CLOUDFLARE_D1_DATABASE_NAME` defaults to `fuzzforge`
 - `CLOUDFLARE_R2_BUCKET_NAME` defaults to `fuzzforge-wasm`
