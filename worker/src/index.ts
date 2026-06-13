@@ -3,6 +3,7 @@ import verifierModule from "../generated/verifier.wasm";
 export interface Env {
   DB: D1Database;
   WASM_BUCKET: R2Bucket;
+  ASSETS: Fetcher;
   GITHUB_APP_CLIENT_ID?: string;
   GITHUB_API_BASE_URL?: string;
 }
@@ -45,6 +46,25 @@ interface ProgramRow {
 interface ProgramListResponse {
   programs: ProgramRow[];
   next_cursor: string | null;
+}
+
+interface ProofStreamProgram {
+  program_hash: string;
+  average_fuel_consumed: number | null;
+}
+
+interface ProofStreamBucket {
+  program_hash: string;
+  bucket_index: number;
+  verifier_version: number;
+  observation_hash: string;
+  seed_hex: string;
+}
+
+interface ProofStreamSnapshot {
+  timestamp_ms: number;
+  programs: ProofStreamProgram[];
+  buckets: ProofStreamBucket[];
 }
 
 interface GitHubUser {
@@ -175,7 +195,21 @@ export default {
         return streamHashResults(request, url, env);
       }
 
-      return json({ error: "not_found" }, { status: 404 });
+      if (
+        parts[0] === "api" &&
+        parts[1] === "proofs" &&
+        parts[2] === "stream" &&
+        parts.length === 3 &&
+        request.method === "GET"
+      ) {
+        return streamProofs(request, url, env);
+      }
+
+      if (parts[0] === "api") {
+        return json({ error: "not_found" }, { status: 404 });
+      }
+
+      return env.ASSETS.fetch(request);
     } catch (error) {
       if (error instanceof HttpError) {
         return json({ error: error.message }, { status: error.status });
@@ -527,6 +561,113 @@ function streamHashResults(request: Request, url: URL, env: Env): Response {
       },
     }),
   );
+}
+
+function streamProofs(request: Request, url: URL, env: Env): Response {
+  const encoder = new TextEncoder();
+  const intervalMs = Math.min(
+    parseNonNegativeInt(url.searchParams.get("interval_ms"), 1000),
+    MAX_STREAM_INTERVAL_MS,
+  );
+
+  const body = new ReadableStream({
+    async start(controller) {
+      let closed = false;
+      request.signal.addEventListener("abort", () => {
+        closed = true;
+        try {
+          controller.close();
+        } catch {
+          // The client may have already closed the stream.
+        }
+      });
+
+      let snapshot = await loadProofStreamSnapshot(env);
+      controller.enqueue(encoder.encode(sse("snapshot", snapshot)));
+      let previous = proofBucketSignatures(snapshot.buckets);
+
+      while (!closed) {
+        await sleep(intervalMs);
+        if (closed) {
+          break;
+        }
+
+        snapshot = await loadProofStreamSnapshot(env);
+        const current = proofBucketSignatures(snapshot.buckets);
+        const changedBuckets = snapshot.buckets.filter((bucket) => {
+          const key = proofBucketKey(bucket);
+          return previous.get(key) !== proofBucketSignature(bucket);
+        });
+
+        if (changedBuckets.length === 0) {
+          controller.enqueue(
+            encoder.encode(sse("heartbeat", { timestamp_ms: snapshot.timestamp_ms })),
+          );
+        } else {
+          const changedPrograms = new Set(changedBuckets.map((bucket) => bucket.program_hash));
+          controller.enqueue(
+            encoder.encode(
+              sse("proof", {
+                timestamp_ms: snapshot.timestamp_ms,
+                programs: snapshot.programs.filter((program) =>
+                  changedPrograms.has(program.program_hash),
+                ),
+                buckets: changedBuckets,
+              }),
+            ),
+          );
+        }
+        previous = current;
+      }
+    },
+  });
+
+  return cors(
+    new Response(body, {
+      headers: {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-store",
+        connection: "keep-alive",
+      },
+    }),
+  );
+}
+
+async function loadProofStreamSnapshot(env: Env): Promise<ProofStreamSnapshot> {
+  const [programs, buckets] = await Promise.all([
+    env.DB.prepare(
+      `SELECT program_hash, average_fuel_consumed
+       FROM programs
+       ORDER BY program_hash ASC`,
+    ).all<ProofStreamProgram>(),
+    env.DB.prepare(
+      `SELECT
+        program_hash,
+        bucket_index,
+        verifier_version,
+        observation_hash,
+        seed_hex
+       FROM hll_buckets
+       ORDER BY program_hash ASC, bucket_index ASC`,
+    ).all<ProofStreamBucket>(),
+  ]);
+  return {
+    timestamp_ms: Date.now(),
+    programs: programs.results,
+    buckets: buckets.results,
+  };
+}
+
+function proofBucketSignatures(buckets: ProofStreamBucket[]): Map<string, string> {
+  return new Map(buckets.map((bucket) => [proofBucketKey(bucket), proofBucketSignature(bucket)]));
+}
+
+function proofBucketKey(bucket: ProofStreamBucket): string {
+  return `${bucket.program_hash}:${bucket.bucket_index}`;
+}
+
+function proofBucketSignature(bucket: ProofStreamBucket): string {
+  return `${bucket.verifier_version}:${bucket.observation_hash}:${bucket.seed_hex}`;
 }
 
 function validateProofObservation(value: unknown): StoredObservation {

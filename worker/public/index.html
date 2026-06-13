@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>FuzzForge</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">FuzzForge</p>
+          <h1>Live proof counter</h1>
+        </div>
+        <div class="status" data-status="connecting">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="connectionStatus">Connecting</span>
+        </div>
+      </header>
+
+      <section class="metrics" aria-label="Live metrics">
+        <div class="metric-primary">
+          <div class="metric-head">
+            <div class="segmented" role="group" aria-label="Metric">
+              <button class="segment active" type="button" data-metric="tests">Tests</button>
+              <button class="segment" type="button" data-metric="fuel">Instructions</button>
+            </div>
+            <span id="programCount" class="muted">0 programs</span>
+          </div>
+          <div id="totalValue" class="total">0</div>
+          <div class="rate-row">
+            <span id="rateValue">0/sec</span>
+            <span id="witnessCount" class="muted">0 witnesses</span>
+          </div>
+          <canvas id="sparkline" width="720" height="120" aria-label="Rate sparkline"></canvas>
+        </div>
+
+        <div class="runner">
+          <div>
+            <p class="eyebrow">Browser runner</p>
+            <h2 id="runnerState">Idle</h2>
+          </div>
+          <dl>
+            <div>
+              <dt>Program</dt>
+              <dd id="runnerProgram">-</dd>
+            </div>
+            <div>
+              <dt>Submitted</dt>
+              <dd id="submittedCount">0</dd>
+            </div>
+            <div>
+              <dt>Queue</dt>
+              <dd id="queueCount">0</dd>
+            </div>
+          </dl>
+          <div class="runner-actions">
+            <button id="startRunner" class="command primary" type="button">Start</button>
+            <button id="stopRunner" class="command" type="button" disabled>Stop</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="programs" aria-label="Program activity">
+        <div class="section-head">
+          <h2>Programs</h2>
+          <span id="lastUpdate" class="muted">No events yet</span>
+        </div>
+        <div id="programList" class="program-list"></div>
+      </section>
+    </main>
+  </body>
+</html>
