@@ -404,6 +404,20 @@ describe("fuzzforge worker api", () => {
     expect(witnesses[0].observation_hash).toBe(SAME_BUCKET_LOW_HASH.observation_hash);
   });
 
+  test("rejects same-bucket observations that cannot improve the witness before verification", async () => {
+    await uploadWasm();
+
+    const first = await submitProof(proofObservation(SAME_BUCKET_LOW_HASH));
+    expect(first.status, await first.clone().text()).toBe(200);
+
+    const response = await submitProof({
+      ...proofObservation(SAME_BUCKET_HIGH_HASH),
+      seed_hex: "ff",
+    });
+    expect(response.status, await response.clone().text()).toBe(409);
+    await expect(response.json()).resolves.toEqual({ error: "observation_not_improved" });
+  });
+
   test("rejects tampered observations before writing hash results", async () => {
     await uploadWasm();
     const tampered = {

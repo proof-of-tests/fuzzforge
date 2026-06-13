@@ -365,6 +365,15 @@ async function listPrograms(url: URL, env: Env): Promise<Response> {
 
 async function putProof(request: Request, env: Env, programHash: string): Promise<Response> {
   const observation = validateProofObservation(await request.json());
+  const bucket = observationBucket(observation.observation_hash);
+  const previousObservationHash = await loadBucketObservationHash(env, programHash, bucket.index);
+  if (
+    previousObservationHash !== null &&
+    previousObservationHash < observation.observation_hash
+  ) {
+    throw new HttpError(409, "observation_not_improved");
+  }
+
   const wasmObject = await env.WASM_BUCKET.get(wasmKey(programHash));
   if (wasmObject === null) {
     throw new HttpError(404, "wasm_not_found");
@@ -375,7 +384,6 @@ async function putProof(request: Request, env: Env, programHash: string): Promis
   const statements: D1PreparedStatement[] = [
     fuelEstimateUpdateStatement(env, programHash, verification),
   ];
-  const bucket = observationBucket(observation.observation_hash);
   statements.push(
     env.DB.prepare(
       `INSERT INTO hll_buckets (
@@ -431,6 +439,21 @@ function fuelEstimateUpdateStatement(
       new Date().toISOString(),
       programHash,
     );
+}
+
+async function loadBucketObservationHash(
+  env: Env,
+  programHash: string,
+  bucketIndex: number,
+): Promise<string | null> {
+  const row = await env.DB.prepare(
+    `SELECT observation_hash
+     FROM hll_buckets
+     WHERE program_hash = ? AND bucket_index = ?`,
+  )
+    .bind(programHash, bucketIndex)
+    .first<{ observation_hash: string }>();
+  return row?.observation_hash ?? null;
 }
 
 async function getProof(env: Env, programHash: string): Promise<Response> {
