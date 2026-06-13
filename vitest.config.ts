@@ -9,7 +9,10 @@ export default defineWorkersConfig(async () => {
         workers: {
           wrangler: { configPath: "wrangler.toml" },
           miniflare: {
-            bindings: { TEST_MIGRATIONS: migrations },
+            bindings: {
+              GITHUB_APP_CLIENT_ID: "test-client-id",
+              TEST_MIGRATIONS: migrations,
+            },
           },
         },
       },

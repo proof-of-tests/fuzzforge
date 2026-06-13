@@ -3,6 +3,8 @@ import verifierModule from "../generated/verifier.wasm";
 export interface Env {
   DB: D1Database;
   WASM_BUCKET: R2Bucket;
+  GITHUB_APP_CLIENT_ID?: string;
+  GITHUB_API_BASE_URL?: string;
 }
 
 interface HllRecord {
@@ -27,7 +29,29 @@ interface BucketRow {
   seed_hex: string;
 }
 
+interface ProgramRow {
+  program_hash: string;
+  github_repository: string | null;
+  github_verified_by: string | null;
+  github_verified_at: string | null;
+  wasm_bytes: number;
+  created_at: string;
+  updated_at: string;
+}
+
+interface GitHubUser {
+  login?: unknown;
+}
+
+interface GitHubRepository {
+  permissions?: {
+    admin?: unknown;
+    push?: unknown;
+  };
+}
+
 const HASH_RE = /^[0-9a-f]{64}$/;
+const GITHUB_REPO_RE = /^[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?\/[a-z0-9._-]{1,100}$/;
 const HLL_PRECISION = 6;
 const HLL_BUCKETS = 1 << HLL_PRECISION;
 const MAX_STREAM_INTERVAL_MS = 10_000;
@@ -46,6 +70,7 @@ type VerifierExports = {
   ff_alloc(len: number): number;
   ff_dealloc(ptr: number, len: number): void;
   ff_hash_hex(wasmPtr: number, wasmLen: number, outPtr: number, outLen: number): number;
+  ff_repository(wasmPtr: number, wasmLen: number, outPtr: number, outLen: number): number;
   ff_verify(wasmPtr: number, wasmLen: number, recordPtr: number, recordLen: number): number;
 };
 
@@ -63,6 +88,17 @@ export default {
     try {
       if (request.method === "GET" && url.pathname === "/health") {
         return json({ ok: true });
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/auth/github") {
+        return json({ client_id: env.GITHUB_APP_CLIENT_ID ?? null });
+      }
+
+      if (parts[0] === "api" && parts[1] === "programs" && parts.length === 3) {
+        const programHash = normalizeProgramHash(parts[2]);
+        if (request.method === "GET") {
+          return await getProgram(env, programHash);
+        }
       }
 
       if (parts[0] === "api" && parts[1] === "programs" && parts.length === 4) {
@@ -124,13 +160,56 @@ async function putWasm(request: Request, env: Env, programHash: string): Promise
   if (actualHash !== programHash) {
     throw new HttpError(400, "wasm_hash_mismatch");
   }
+  const githubRepository = await queryWasmRepository(bytes);
+  const githubVerifiedBy =
+    githubRepository === null
+      ? null
+      : await verifyGitHubRepositoryAccess(request, env, githubRepository);
 
   await env.WASM_BUCKET.put(wasmKey(programHash), bytes, {
     httpMetadata: { contentType: "application/wasm" },
-    customMetadata: { programHash },
+    customMetadata:
+      githubRepository === null
+        ? { programHash }
+        : { programHash, githubRepository },
   });
 
-  return json({ program_hash: programHash, bytes: bytes.byteLength });
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    `INSERT INTO programs (
+      program_hash,
+      github_repository,
+      github_verified_by,
+      github_verified_at,
+      wasm_bytes,
+      created_at,
+      updated_at
+    )
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(program_hash) DO UPDATE SET
+      github_repository = excluded.github_repository,
+      github_verified_by = excluded.github_verified_by,
+      github_verified_at = excluded.github_verified_at,
+      wasm_bytes = excluded.wasm_bytes,
+      updated_at = excluded.updated_at`,
+  )
+    .bind(
+      programHash,
+      githubRepository,
+      githubVerifiedBy,
+      githubRepository === null ? null : now,
+      bytes.byteLength,
+      now,
+      now,
+    )
+    .run();
+
+  return json({
+    program_hash: programHash,
+    bytes: bytes.byteLength,
+    github_repository: githubRepository,
+    github_verified_by: githubVerifiedBy,
+  });
 }
 
 async function getWasm(env: Env, programHash: string): Promise<Response> {
@@ -144,6 +223,27 @@ async function getWasm(env: Env, programHash: string): Promise<Response> {
   headers.set("etag", object.httpEtag);
   headers.set("cache-control", "public, max-age=31536000, immutable");
   return cors(new Response(object.body, { headers }));
+}
+
+async function getProgram(env: Env, programHash: string): Promise<Response> {
+  const row = await env.DB.prepare(
+    `SELECT
+      program_hash,
+      github_repository,
+      github_verified_by,
+      github_verified_at,
+      wasm_bytes,
+      created_at,
+      updated_at
+     FROM programs
+     WHERE program_hash = ?`,
+  )
+    .bind(programHash)
+    .first<ProgramRow>();
+  if (!row) {
+    throw new HttpError(404, "program_not_found");
+  }
+  return json(row);
 }
 
 async function putProof(request: Request, env: Env, programHash: string): Promise<Response> {
@@ -307,6 +407,103 @@ function validateHllRecord(value: unknown, programHash: string): HllRecord {
     }
   }
   return record as HllRecord;
+}
+
+async function verifyGitHubRepositoryAccess(
+  request: Request,
+  env: Env,
+  repository: string,
+): Promise<string> {
+  const token = bearerToken(request);
+  if (token === null) {
+    throw new HttpError(401, "github_auth_required");
+  }
+
+  const base = (env.GITHUB_API_BASE_URL ?? "https://api.github.com").replace(/\/+$/, "");
+  const userResponse = await fetch(`${base}/user`, {
+    headers: githubHeaders(token),
+  });
+  if (userResponse.status === 401 || userResponse.status === 403) {
+    throw new HttpError(401, "github_auth_invalid");
+  }
+  if (!userResponse.ok) {
+    throw new HttpError(401, "github_auth_invalid");
+  }
+  const user = (await userResponse.json()) as GitHubUser;
+  if (typeof user.login !== "string" || user.login.length === 0) {
+    throw new HttpError(401, "github_auth_invalid");
+  }
+
+  const [owner, repo] = repository.split("/");
+  const repositoryResponse = await fetch(
+    `${base}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`,
+    { headers: githubHeaders(token) },
+  );
+  if (repositoryResponse.status === 401) {
+    throw new HttpError(401, "github_auth_invalid");
+  }
+  if (repositoryResponse.status === 404) {
+    throw new HttpError(403, "repository_access_denied");
+  }
+  if (!repositoryResponse.ok) {
+    throw new HttpError(403, "repository_access_denied");
+  }
+  const githubRepository = (await repositoryResponse.json()) as GitHubRepository;
+  if (
+    githubRepository.permissions?.admin !== true &&
+    githubRepository.permissions?.push !== true
+  ) {
+    throw new HttpError(403, "repository_access_denied");
+  }
+
+  return user.login;
+}
+
+async function queryWasmRepository(wasm: ArrayBuffer): Promise<string | null> {
+  const exports = await verifierExports();
+  const wasmBytes = new Uint8Array(wasm);
+  const wasmPtr = copyIntoVerifier(exports, wasmBytes);
+  const outPtr = exports.ff_alloc(256);
+  try {
+    const len = exports.ff_repository(wasmPtr, wasmBytes.byteLength, outPtr, 256);
+    if (len < 0) {
+      throw new HttpError(400, VERIFY_CODES[-len] ?? "repository_query_failed");
+    }
+    if (len === 0) {
+      return null;
+    }
+    const repository = new TextDecoder().decode(
+      new Uint8Array(exports.memory.buffer, outPtr, len),
+    );
+    return normalizeGitHubRepository(repository);
+  } finally {
+    exports.ff_dealloc(wasmPtr, wasmBytes.byteLength);
+    exports.ff_dealloc(outPtr, 256);
+  }
+}
+
+function githubHeaders(token: string): HeadersInit {
+  return {
+    accept: "application/vnd.github+json",
+    authorization: `Bearer ${token}`,
+    "user-agent": "fuzzforge-worker",
+    "x-github-api-version": "2026-03-10",
+  };
+}
+
+function bearerToken(request: Request): string | null {
+  const authorization = request.headers.get("authorization");
+  const match = authorization?.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1].trim() : null;
+}
+
+function normalizeGitHubRepository(value: string): string {
+  const repository = value.trim().toLowerCase();
+  const repo = repository.split("/")[1] ?? "";
+  if (!GITHUB_REPO_RE.test(repository) || repo === "." || repo === "..") {
+    throw new HttpError(400, "invalid_wasm_repository");
+  }
+  return repository;
 }
 
 async function hashWasm(wasm: ArrayBuffer): Promise<string> {
@@ -499,7 +696,7 @@ function json(value: unknown, init: ResponseInit = {}): Response {
 function cors(response: Response): Response {
   response.headers.set("access-control-allow-origin", "*");
   response.headers.set("access-control-allow-methods", "GET, PUT, POST, OPTIONS");
-  response.headers.set("access-control-allow-headers", "content-type");
+  response.headers.set("access-control-allow-headers", "authorization, content-type");
   return response;
 }
 

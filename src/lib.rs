@@ -18,6 +18,7 @@ pub const DEFAULT_SAVE_FUEL_INTERVAL: u64 = DEFAULT_FUEL * 100;
 pub const DEFAULT_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_SEED_BYTES: usize = 32;
 const DEFAULT_TABLE_ELEMENTS: usize = 10_000;
+const REPOSITORY_QUERY_ARGS: [&[u8]; 2] = [b"fuzzforge", b"--repository"];
 
 const WASI_MODULE: &str = "wasi_snapshot_preview1";
 const ERR_SUCCESS: i32 = 0;
@@ -406,6 +407,69 @@ pub fn hash_wasm_file(path: &Path) -> Result<String> {
     Ok(hash_bytes_hex(&bytes))
 }
 
+pub fn query_wasm_repository_file(path: &Path) -> Result<Option<String>> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    query_wasm_repository(&bytes)
+}
+
+pub fn query_wasm_repository(wasm: &[u8]) -> Result<Option<String>> {
+    let program = WasmProgram::compile(wasm)?;
+    let output = program
+        .execute_with_args(
+            Vec::new(),
+            RunConfig::default(),
+            REPOSITORY_QUERY_ARGS
+                .iter()
+                .map(|arg| arg.to_vec())
+                .collect(),
+        )
+        .context("failed to query WASM repository")?;
+    if output.status != RunStatus::Success {
+        return Ok(None);
+    }
+    let stdout = std::str::from_utf8(&output.stdout)
+        .context("WASM repository response is not valid UTF-8")?
+        .trim();
+    if stdout.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(normalize_github_repository(stdout)?))
+}
+
+fn normalize_github_repository(value: &str) -> Result<String> {
+    let repository = value.trim().to_ascii_lowercase();
+    let Some((owner, repo)) = repository.split_once('/') else {
+        bail!("GitHub repository must use owner/repo format");
+    };
+    if owner.is_empty()
+        || repo.is_empty()
+        || repository.split('/').count() != 2
+        || !is_valid_github_owner(owner)
+        || !is_valid_github_repo(repo)
+    {
+        bail!("invalid GitHub repository `{value}`");
+    }
+    Ok(repository)
+}
+
+fn is_valid_github_owner(owner: &str) -> bool {
+    owner.len() <= 39
+        && owner
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && !owner.starts_with('-')
+        && !owner.ends_with('-')
+}
+
+fn is_valid_github_repo(repo: &str) -> bool {
+    repo.len() <= 100
+        && repo
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        && repo != "."
+        && repo != ".."
+}
+
 pub fn generate_seed(seed_bytes: usize) -> Result<Vec<u8>> {
     if seed_bytes == 0 {
         bail!("seed byte length must be greater than zero");
@@ -482,6 +546,15 @@ impl WasmProgram {
     }
 
     fn execute(&self, stdin: Vec<u8>, config: RunConfig) -> Result<ExecutionOutput> {
+        self.execute_with_args(stdin, config, Vec::new())
+    }
+
+    fn execute_with_args(
+        &self,
+        stdin: Vec<u8>,
+        config: RunConfig,
+        args: Vec<Vec<u8>>,
+    ) -> Result<ExecutionOutput> {
         let limits = StoreLimitsBuilder::new()
             .memory_size(config.memory_bytes)
             .table_elements(DEFAULT_TABLE_ELEMENTS)
@@ -491,6 +564,7 @@ impl WasmProgram {
             .trap_on_grow_failure(true)
             .build();
         let state = HostState {
+            args,
             stdin,
             stdin_pos: 0,
             stdout: Vec::new(),
@@ -789,6 +863,7 @@ struct ExecutionOutput {
 
 #[derive(Debug)]
 struct HostState {
+    args: Vec<Vec<u8>>,
     stdin: Vec<u8>,
     stdin_pos: usize,
     stdout: Vec<u8>,
@@ -929,14 +1004,41 @@ fn args_sizes_get(mut caller: Caller<'_, HostState>, argc: i32, argv_buf_size: i
     let Some(memory) = guest_memory(&caller) else {
         return ERR_FAULT;
     };
-    let first = write_u32(&memory, &mut caller, argc, 0);
+    let arg_count = caller.data().args.len();
+    let buf_size = caller
+        .data()
+        .args
+        .iter()
+        .map(|arg| arg.len().saturating_add(1))
+        .sum::<usize>();
+    let first = write_u32(&memory, &mut caller, argc, arg_count as u32);
     if first != ERR_SUCCESS {
         return first;
     }
-    write_u32(&memory, &mut caller, argv_buf_size, 0)
+    write_u32(&memory, &mut caller, argv_buf_size, buf_size as u32)
 }
 
-fn args_get(_caller: Caller<'_, HostState>, _argv: i32, _argv_buf: i32) -> i32 {
+fn args_get(mut caller: Caller<'_, HostState>, argv: i32, argv_buf: i32) -> i32 {
+    let Some(memory) = guest_memory(&caller) else {
+        return ERR_FAULT;
+    };
+    let args = caller.data().args.clone();
+    let mut buf_offset = ptr_to_usize(argv_buf);
+    for (index, arg) in args.iter().enumerate() {
+        let ptr = ptr_to_usize(argv).saturating_add(index.saturating_mul(4));
+        let code = write_u32(&memory, &mut caller, ptr as i32, buf_offset as u32);
+        if code != ERR_SUCCESS {
+            return code;
+        }
+        if memory.write(&mut caller, buf_offset, arg).is_err() {
+            return ERR_FAULT;
+        }
+        buf_offset = buf_offset.saturating_add(arg.len());
+        if memory.write(&mut caller, buf_offset, &[0]).is_err() {
+            return ERR_FAULT;
+        }
+        buf_offset = buf_offset.saturating_add(1);
+    }
     ERR_SUCCESS
 }
 
@@ -1068,6 +1170,29 @@ mod tests {
         wat::parse_str(wat).expect("valid wat")
     }
 
+    fn repository_wasm(repository: &str) -> Vec<u8> {
+        wat_bytes(&format!(
+            r#"
+            (module
+              (import "wasi_snapshot_preview1" "fd_write"
+                (func $fd_write (param i32 i32 i32 i32) (result i32)))
+              (import "wasi_snapshot_preview1" "args_sizes_get"
+                (func $args_sizes_get (param i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 64) "{repository}")
+              (func (export "_start")
+                (drop (call $args_sizes_get (i32.const 0) (i32.const 4)))
+                (if (i32.gt_u (i32.load (i32.const 0)) (i32.const 1))
+                  (then
+                    (i32.store (i32.const 8) (i32.const 64))
+                    (i32.store (i32.const 12) (i32.const {len}))
+                    (drop (call $fd_write
+                      (i32.const 1) (i32.const 8) (i32.const 1) (i32.const 16)))))))
+            "#,
+            len = repository.len()
+        ))
+    }
+
     fn stored_observation(seed_hex: &str) -> StoredObservation {
         StoredObservation::from_observation(Observation {
             program_hash: "a".repeat(64),
@@ -1084,6 +1209,27 @@ mod tests {
         let wasm = wat_bytes(r#"(module (func (export "_start")))"#);
         assert_eq!(hash_bytes_hex(&wasm), hash_bytes_hex(&wasm));
         assert_eq!(hash_bytes_hex(&wasm).len(), 64);
+    }
+
+    #[test]
+    fn wasm_repository_is_absent_by_default() {
+        let wasm = wat_bytes(r#"(module (func (export "_start")))"#);
+        assert_eq!(query_wasm_repository(&wasm).unwrap(), None);
+    }
+
+    #[test]
+    fn wasm_repository_query_runs_with_repository_arg() {
+        let wasm = repository_wasm("Owner/Repo_Name");
+        assert_eq!(
+            query_wasm_repository(&wasm).unwrap(),
+            Some("owner/repo_name".to_owned())
+        );
+    }
+
+    #[test]
+    fn wasm_repository_query_rejects_invalid_repository() {
+        let wasm = repository_wasm("bad owner/repo");
+        assert!(query_wasm_repository(&wasm).is_err());
     }
 
     #[test]
