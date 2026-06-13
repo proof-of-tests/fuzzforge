@@ -43,8 +43,11 @@ interface GitHubUser {
   login?: unknown;
 }
 
-interface GitHubPermission {
-  permission?: unknown;
+interface GitHubRepository {
+  permissions?: {
+    admin?: unknown;
+    push?: unknown;
+  };
 }
 
 const HASH_RE = /^[0-9a-f]{64}$/;
@@ -432,21 +435,24 @@ async function verifyGitHubRepositoryAccess(
   }
 
   const [owner, repo] = repository.split("/");
-  const permissionResponse = await fetch(
-    `${base}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/collaborators/${encodeURIComponent(user.login)}/permission`,
+  const repositoryResponse = await fetch(
+    `${base}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`,
     { headers: githubHeaders(token) },
   );
-  if (permissionResponse.status === 401) {
+  if (repositoryResponse.status === 401) {
     throw new HttpError(401, "github_auth_invalid");
   }
-  if (permissionResponse.status === 404) {
+  if (repositoryResponse.status === 404) {
     throw new HttpError(403, "repository_access_denied");
   }
-  if (!permissionResponse.ok) {
+  if (!repositoryResponse.ok) {
     throw new HttpError(403, "repository_access_denied");
   }
-  const permission = (await permissionResponse.json()) as GitHubPermission;
-  if (permission.permission !== "write" && permission.permission !== "admin") {
+  const githubRepository = (await repositoryResponse.json()) as GitHubRepository;
+  if (
+    githubRepository.permissions?.admin !== true &&
+    githubRepository.permissions?.push !== true
+  ) {
     throw new HttpError(403, "repository_access_denied");
   }
 

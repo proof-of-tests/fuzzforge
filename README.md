@@ -126,9 +126,9 @@ bytes match the requested program hash before storing them. The Worker then runs
 the module with empty stdin and argv `fuzzforge --repository`. If that execution
 prints a repository, the Worker requires an `Authorization: Bearer <token>`
 header, checks `GET /user`, then checks
-`GET /repos/:owner/:repo/collaborators/:login/permission`, accepting only `write`
-or `admin`. Empty output or a non-success exit means the module is unassociated
-and the upload remains unauthenticated.
+`GET /repos/:owner/:repo`, accepting only tokens whose effective repository
+permissions include `push` or `admin`. Empty output or a non-success exit means
+the module is unassociated and the upload remains unauthenticated.
 
 Proof uploads are verified inside the Worker with a Rust/wasmi verifier compiled
 to WASM: each submitted observation is rerun against the stored WASM, and only

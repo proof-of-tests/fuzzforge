@@ -135,8 +135,8 @@ describe("fuzzforge worker api", () => {
     await expect(put.json()).resolves.toEqual({ error: "github_auth_invalid" });
   });
 
-  test("rejects associated wasm when github permission is read", async () => {
-    mockGitHubPermission("read");
+  test("rejects associated wasm when github repository permissions are read-only", async () => {
+    mockGitHubRepositoryPermissions({ pull: true, push: false, admin: false });
 
     const put = await SELF.fetch(
       `https://example.com/api/programs/${ASSOCIATED_PROGRAM_HASH}/wasm`,
@@ -150,9 +150,9 @@ describe("fuzzforge worker api", () => {
     await expect(put.json()).resolves.toEqual({ error: "repository_access_denied" });
   });
 
-  test("rejects associated wasm when github permission lookup returns 404", async () => {
+  test("rejects associated wasm when github repository lookup returns 404", async () => {
     mockGitHubUser(200, { login: "alice" });
-    mockGitHubPermissionResponse(404, { message: "Not Found" });
+    mockGitHubRepositoryResponse(404, { message: "Not Found" });
 
     const put = await SELF.fetch(
       `https://example.com/api/programs/${ASSOCIATED_PROGRAM_HASH}/wasm`,
@@ -166,8 +166,8 @@ describe("fuzzforge worker api", () => {
     await expect(put.json()).resolves.toEqual({ error: "repository_access_denied" });
   });
 
-  test("stores associated wasm after verifying github write permission", async () => {
-    mockGitHubPermission("write");
+  test("stores associated wasm after verifying github push permission", async () => {
+    mockGitHubRepositoryPermissions({ pull: true, push: true, admin: false });
 
     const put = await SELF.fetch(
       `https://example.com/api/programs/${ASSOCIATED_PROGRAM_HASH}/wasm`,
@@ -379,9 +379,9 @@ function hexToBytes(hex: string): Uint8Array {
   return new Uint8Array(hex.match(/.{2}/g)!.map((byte) => Number.parseInt(byte, 16)));
 }
 
-function mockGitHubPermission(permission: string) {
+function mockGitHubRepositoryPermissions(permissions: object) {
   mockGitHubUser(200, { login: "alice" });
-  mockGitHubPermissionResponse(200, { permission });
+  mockGitHubRepositoryResponse(200, { permissions });
 }
 
 function mockGitHubUser(status: number, body: object) {
@@ -392,12 +392,12 @@ function mockGitHubUser(status: number, body: object) {
   );
 }
 
-function mockGitHubPermissionResponse(status: number, body: object) {
+function mockGitHubRepositoryResponse(status: number, body: object) {
   fetchMock
     .get("https://api.github.com")
     .intercept({
       method: "GET",
-      path: "/repos/owner/repo/collaborators/alice/permission",
+      path: "/repos/owner/repo",
     })
     .reply(status, body, { headers: { "content-type": "application/json" } });
 }
