@@ -78,6 +78,13 @@ describe("fuzzforge worker api", () => {
     await expect(get.json()).resolves.toEqual({ client_id: "test-client-id" });
   });
 
+  test("serves the static homepage", async () => {
+    const get = await SELF.fetch("https://example.com/");
+    expect(get.status).toBe(200);
+    expect(get.headers.get("content-type")).toContain("text/html");
+    await expect(get.text()).resolves.toContain("Live proof counter");
+  });
+
   test("rejects wasm uploaded under the wrong hash", async () => {
     const put = await SELF.fetch(`https://example.com/api/programs/${"a".repeat(64)}/wasm`, {
       method: "PUT",
@@ -437,6 +444,45 @@ describe("fuzzforge worker api", () => {
     expect(text).toContain("event: ");
     expect(text).toContain("total_tests");
   });
+
+  test("streams proof snapshots with programs and bucket witnesses", async () => {
+    await uploadWasm();
+    await submitProof(proofRecord([OBSERVATIONS[0]]));
+
+    const response = await SELF.fetch("https://example.com/api/proofs/stream?interval_ms=1");
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("text/event-stream");
+
+    const reader = response.body!.getReader();
+    const chunk = await reader.read();
+    await reader.cancel();
+    const text = new TextDecoder().decode(chunk.value);
+    expect(text).toContain("event: snapshot");
+
+    const payload = parseSseData(text) as {
+      timestamp_ms: number;
+      programs: Array<{ program_hash: string; average_fuel_consumed: number }>;
+      buckets: Array<{
+        program_hash: string;
+        bucket_index: number;
+        seed_hex: string;
+        observation_hash: string;
+        verifier_version: number;
+      }>;
+    };
+    expect(payload.timestamp_ms).toEqual(expect.any(Number));
+    expect(payload.programs).toContainEqual({
+      program_hash: PROGRAM_HASH,
+      average_fuel_consumed: expect.any(Number),
+    });
+    expect(payload.buckets).toContainEqual({
+      program_hash: PROGRAM_HASH,
+      bucket_index: observationBucket(OBSERVATIONS[0].observation_hash),
+      seed_hex: OBSERVATIONS[0].seed_hex,
+      observation_hash: OBSERVATIONS[0].observation_hash,
+      verifier_version: 1,
+    });
+  });
 });
 
 async function uploadWasm() {
@@ -483,6 +529,14 @@ function proofRecord(observations: Array<{ seed_hex: string; observation_hash: s
 function observationBucket(observationHash: string): number {
   const value = BigInt(`0x${observationHash.slice(0, 16)}`);
   return Number(value >> 58n);
+}
+
+function parseSseData(text: string): unknown {
+  const dataLine = text.split("\n").find((line) => line.startsWith("data: "));
+  if (!dataLine) {
+    throw new Error(`missing SSE data line: ${text}`);
+  }
+  return JSON.parse(dataLine.slice("data: ".length));
 }
 
 function hexToBytes(hex: string): Uint8Array {

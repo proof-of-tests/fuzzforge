@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build:verifier": "cargo build --manifest-path worker/verifier/Cargo.toml --release --target wasm32-unknown-unknown && mkdir -p worker/generated && cp worker/verifier/target/wasm32-unknown-unknown/release/fuzzforge_worker_verifier.wasm worker/generated/verifier.wasm",
+    "build:verifier": "cargo build --manifest-path worker/verifier/Cargo.toml --release --target wasm32-unknown-unknown && mkdir -p worker/generated worker/public && cp worker/verifier/target/wasm32-unknown-unknown/release/fuzzforge_worker_verifier.wasm worker/generated/verifier.wasm && cp worker/generated/verifier.wasm worker/public/verifier.wasm",
     "test": "cargo test && npm run typecheck && npm run test:worker",
     "test:worker": "npm run build:verifier && vitest run",
     "typecheck": "npm run build:verifier && tsc --noEmit",

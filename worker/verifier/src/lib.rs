@@ -73,6 +73,15 @@ pub struct StoredObservation {
     pub observation_hash: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct BrowserRunObservation {
+    seed_hex: String,
+    verifier_version: u32,
+    observation_hash: String,
+    fuel_consumed: u64,
+    bucket_index: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Observation {
     program_hash: String,
@@ -202,6 +211,53 @@ pub unsafe extern "C" fn ff_verify(
     }
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ff_program_new(wasm_ptr: *const u8, wasm_len: usize) -> usize {
+    if wasm_ptr.is_null() {
+        return 0;
+    }
+    let wasm = unsafe { slice::from_raw_parts(wasm_ptr, wasm_len) };
+    match WasmProgram::compile(wasm) {
+        Ok(program) => Box::into_raw(Box::new(program)) as usize,
+        Err(()) => 0,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ff_program_free(program_ptr: usize) {
+    if program_ptr != 0 {
+        drop(unsafe { Box::from_raw(program_ptr as *mut WasmProgram) });
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ff_program_run(
+    program_ptr: usize,
+    seed_ptr: *const u8,
+    seed_len: usize,
+    out_ptr: *mut u8,
+    out_len: usize,
+) -> i32 {
+    if program_ptr == 0 || seed_ptr.is_null() || out_ptr.is_null() {
+        return -VERIFY_INVALID_INPUT;
+    }
+    let program = unsafe { &*(program_ptr as *const WasmProgram) };
+    let seed = unsafe { slice::from_raw_parts(seed_ptr, seed_len) };
+    let out = unsafe { slice::from_raw_parts_mut(out_ptr, out_len) };
+    match run_browser_observation(program, seed.to_vec())
+        .and_then(|observation| serde_json::to_vec(&observation).map_err(|_| VERIFY_INVALID_RECORD))
+    {
+        Ok(bytes) => {
+            if bytes.len() > out.len() {
+                return -VERIFY_INVALID_INPUT;
+            }
+            out[..bytes.len()].copy_from_slice(&bytes);
+            bytes.len() as i32
+        }
+        Err(code) => -code,
+    }
+}
+
 fn estimate_fuel(wasm: &[u8]) -> Result<u64, i32> {
     let program = WasmProgram::compile(wasm).map_err(|_| VERIFY_UNSUPPORTED_WASM)?;
     let output = program
@@ -239,6 +295,34 @@ fn verify(wasm: &[u8], record_json: &[u8]) -> Result<(), i32> {
         verify_observation(&program, &record.program_hash, expected)?;
     }
     Ok(())
+}
+
+fn run_browser_observation(
+    program: &WasmProgram,
+    seed: Vec<u8>,
+) -> Result<BrowserRunObservation, i32> {
+    let seed_hex = bytes_to_hex(&seed);
+    let config = verifier_version_config(1);
+    let output = program
+        .execute(seed, config.clone())
+        .map_err(|_| VERIFY_OBSERVATION_MISMATCH)?;
+    let stdout_hash = hash_bytes_hex(&output.stdout);
+    let stored = StoredObservation::from_observation(Observation {
+        program_hash: program.program_hash.clone(),
+        seed_hex,
+        stdout_hash,
+        status: output.status,
+        fuel_consumed: output.fuel_consumed,
+        config,
+    });
+    let bucket_index = observation_bucket(&stored.observation_hash)?;
+    Ok(BrowserRunObservation {
+        seed_hex: stored.seed_hex,
+        verifier_version: stored.verifier_version,
+        observation_hash: stored.observation_hash,
+        fuel_consumed: output.fuel_consumed,
+        bucket_index,
+    })
 }
 
 fn query_metadata(wasm: &[u8]) -> Result<Option<String>, i32> {
@@ -681,6 +765,16 @@ fn hash_bytes_hex(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut result = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        result.push(HEX[(byte >> 4) as usize] as char);
+        result.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    result
+}
+
 fn seed_from_hex(seed_hex: &str) -> Option<Vec<u8>> {
     if seed_hex.is_empty() || !seed_hex.len().is_multiple_of(2) {
         return None;
@@ -712,5 +806,76 @@ fn hex_digit(byte: u8) -> Option<u8> {
         b'a'..=b'f' => Some(byte - b'a' + 10),
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WASM_HEX: &str =
+        "0061736d0100000001040160000003020100070a01065f737461727400000a040102000b";
+
+    #[derive(Debug, Deserialize)]
+    struct TestRunObservation {
+        seed_hex: String,
+        verifier_version: u32,
+        observation_hash: String,
+        fuel_consumed: u64,
+        bucket_index: usize,
+    }
+
+    #[test]
+    fn browser_program_run_export_returns_deterministic_observation() {
+        let wasm = hex_to_bytes(WASM_HEX);
+        let wasm_ptr = copy_into_export_memory(&wasm);
+        let seed = [0u8; 32];
+        let seed_ptr = copy_into_export_memory(&seed);
+        let out_len = 512;
+        let out_ptr = ff_alloc(out_len);
+
+        let program = unsafe { ff_program_new(wasm_ptr, wasm.len()) };
+        assert_ne!(program, 0);
+
+        let len = unsafe { ff_program_run(program, seed_ptr, seed.len(), out_ptr, out_len) };
+        assert!(len > 0);
+        let json = unsafe { slice::from_raw_parts(out_ptr, len as usize) };
+        let observation: TestRunObservation =
+            serde_json::from_slice(json).expect("browser observation json");
+
+        assert_eq!(observation.seed_hex, "00".repeat(32));
+        assert_eq!(observation.verifier_version, 1);
+        assert_eq!(
+            observation.observation_hash,
+            "af0110f5756aeb20d715a7b6f1d1d0d761d00ee0d1cdf86bf4c8b8da4b71542d"
+        );
+        assert_eq!(observation.bucket_index, 43);
+        assert!(observation.fuel_consumed > 0);
+
+        unsafe {
+            ff_program_free(program);
+            ff_dealloc(wasm_ptr, wasm.len());
+            ff_dealloc(seed_ptr, seed.len());
+            ff_dealloc(out_ptr, out_len);
+        }
+    }
+
+    fn copy_into_export_memory(bytes: &[u8]) -> *mut u8 {
+        let ptr = ff_alloc(bytes.len());
+        unsafe {
+            slice::from_raw_parts_mut(ptr, bytes.len()).copy_from_slice(bytes);
+        }
+        ptr
+    }
+
+    fn hex_to_bytes(hex: &str) -> Vec<u8> {
+        hex.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let high = hex_digit(pair[0]).expect("hex high");
+                let low = hex_digit(pair[1]).expect("hex low");
+                (high << 4) | low
+            })
+            .collect()
     }
 }
