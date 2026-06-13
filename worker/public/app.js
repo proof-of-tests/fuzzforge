@@ -499,9 +499,9 @@ function bucketKey(programHash, bucketIndex) {
 
 function formatMetric(value, metric) {
   if (!Number.isFinite(value) || value === 0) {
-    return "0.000e0";
+    return "0.00e0";
   }
-  return value.toExponential(3).replace("e+", "e");
+  return value.toExponential(2).replace("e+", "e");
 }
 
 function escapeHtml(value) {
