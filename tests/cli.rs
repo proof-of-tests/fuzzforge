@@ -48,13 +48,13 @@ fn associated_echo_wasm() -> Vec<u8> {
           (import "wasi_snapshot_preview1" "args_sizes_get"
             (func $args_sizes_get (param i32 i32) (result i32)))
           (memory (export "memory") 1)
-          (data (i32.const 128) "owner/repo")
+          (data (i32.const 128) "{\22github_repository\22:\22owner/repo\22,\22component_name\22:\22api\22,\22version\22:\221.2.3\22}")
           (func (export "_start")
             (drop (call $args_sizes_get (i32.const 92) (i32.const 96)))
             (if (i32.gt_u (i32.load (i32.const 92)) (i32.const 1))
               (then
                 (i32.store (i32.const 0) (i32.const 128))
-                (i32.store (i32.const 4) (i32.const 10))
+                (i32.store (i32.const 4) (i32.const 75))
                 (drop (call $fd_write
                   (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 100))))
               (else

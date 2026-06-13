@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use fuzzforge::{
     DEFAULT_FUEL, DEFAULT_MEMORY_BYTES, DEFAULT_SAVE_FUEL_INTERVAL, DEFAULT_SEED_BYTES, HllRecord,
-    RunConfig, RunSession, Store, generate_seed, hash_wasm_file, query_wasm_repository,
+    RunConfig, RunSession, Store, generate_seed, hash_wasm_file, query_wasm_metadata,
     seed_from_hex, verify_wasm,
 };
 use reqwest::blocking::Client;
@@ -440,8 +440,9 @@ fn submit_proof(
     ensure_submit_record_uses_current_verifier(record)?;
     let wasm = fs::read(wasm_path)
         .with_context(|| format!("failed to read WASM module {}", wasm_path.display()))?;
-    let github_repository =
-        query_wasm_repository(&wasm).context("failed to query WASM repository")?;
+    let github_repository = query_wasm_metadata(&wasm)
+        .context("failed to query WASM metadata")?
+        .and_then(|metadata| metadata.github_repository);
     let github_token = match github_repository.as_deref() {
         Some(repository) => Some(load_valid_github_token().with_context(|| {
             format!(

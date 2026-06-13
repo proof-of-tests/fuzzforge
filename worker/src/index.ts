@@ -80,7 +80,6 @@ type VerifierExports = {
   ff_alloc(len: number): number;
   ff_dealloc(ptr: number, len: number): void;
   ff_hash_hex(wasmPtr: number, wasmLen: number, outPtr: number, outLen: number): number;
-  ff_repository(wasmPtr: number, wasmLen: number, outPtr: number, outLen: number): number;
   ff_metadata(wasmPtr: number, wasmLen: number, outPtr: number, outLen: number): number;
   ff_verify(wasmPtr: number, wasmLen: number, recordPtr: number, recordLen: number): number;
 };

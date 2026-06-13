@@ -54,8 +54,7 @@ stdout and exit successfully instead of running a fuzz test:
 
 `github_repository` can be omitted, null, or empty for unassociated modules.
 `component_name` is optional and may be an empty string. `version` is required
-for `--metadata` responses and must be SemVer. Legacy modules can still handle
-`--repository` and print only `owner/repo`.
+for `--metadata` responses and must be SemVer.
 
 Unassociated WASM uploads do not require authentication. Associated uploads
 require a GitHub App user token for a user with write or admin access to the
@@ -135,13 +134,12 @@ The Worker API lives in `worker/src/index.ts` and uses:
 
 Uploads are treated as untrusted input. The Worker verifies that uploaded WASM
 bytes match the requested program hash before storing them. The Worker then runs
-the module with empty stdin and argv `fuzzforge --metadata`. If that execution
-does not return JSON metadata, the Worker falls back to the legacy
-`fuzzforge --repository` query. If metadata reports a repository, the Worker
-requires an `Authorization: Bearer <token>` header, checks `GET /user`, then
-checks `GET /repos/:owner/:repo`, accepting only tokens whose effective
-repository permissions include `push` or `admin`. Empty output or a non-success
-exit means the module is unassociated and the upload remains unauthenticated.
+the module with empty stdin and argv `fuzzforge --metadata`. If metadata reports
+a repository, the Worker requires an `Authorization: Bearer <token>` header,
+checks `GET /user`, then checks `GET /repos/:owner/:repo`, accepting only tokens
+whose effective repository permissions include `push` or `admin`. Empty output
+or a non-success exit means the module is unassociated and the upload remains
+unauthenticated.
 
 Proof uploads are verified inside the Worker with a Rust/wasmi verifier compiled
 to WASM: each submitted observation is rerun against the stored WASM, and only

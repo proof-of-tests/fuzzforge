@@ -33,7 +33,6 @@ echoing stdin:
 }
 ```
 
-It also supports the legacy `--repository` query, which prints
-`proof-of-tests/fuzzforge`. Uploading the compiled WASM to a FuzzForge API
-therefore requires `fuzzforge auth login` for a GitHub user with write or admin
-access to that repository.
+Uploading the compiled WASM to a FuzzForge API therefore requires
+`fuzzforge auth login` for a GitHub user with write or admin access to that
+repository.

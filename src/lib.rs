@@ -19,7 +19,6 @@ pub const DEFAULT_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_SEED_BYTES: usize = 32;
 const DEFAULT_TABLE_ELEMENTS: usize = 10_000;
 const METADATA_QUERY_ARGS: [&[u8]; 2] = [b"fuzzforge", b"--metadata"];
-const REPOSITORY_QUERY_ARGS: [&[u8]; 2] = [b"fuzzforge", b"--repository"];
 
 const WASI_MODULE: &str = "wasi_snapshot_preview1";
 const ERR_SUCCESS: i32 = 0;
@@ -422,38 +421,14 @@ pub fn hash_wasm_file(path: &Path) -> Result<String> {
     Ok(hash_bytes_hex(&bytes))
 }
 
-pub fn query_wasm_repository_file(path: &Path) -> Result<Option<String>> {
-    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    query_wasm_repository(&bytes)
-}
-
-pub fn query_wasm_repository(wasm: &[u8]) -> Result<Option<String>> {
-    Ok(query_wasm_metadata(wasm)?.and_then(|metadata| metadata.github_repository))
-}
-
 pub fn query_wasm_metadata(wasm: &[u8]) -> Result<Option<WasmMetadata>> {
     let program = WasmProgram::compile(wasm)?;
     let output = execute_metadata_query(&program, &METADATA_QUERY_ARGS)
         .context("failed to query WASM metadata")?;
-    if let Some(stdout) = metadata_stdout(&output)? {
-        if stdout.starts_with('{') {
-            return Ok(Some(parse_wasm_metadata(stdout)?));
-        }
-    }
-    query_legacy_wasm_repository(&program)
-}
-
-fn query_legacy_wasm_repository(program: &WasmProgram) -> Result<Option<WasmMetadata>> {
-    let output = execute_metadata_query(program, &REPOSITORY_QUERY_ARGS)
-        .context("failed to query WASM repository")?;
     let Some(stdout) = metadata_stdout(&output)? else {
         return Ok(None);
     };
-    Ok(Some(WasmMetadata {
-        github_repository: Some(normalize_github_repository(stdout)?),
-        component_name: None,
-        version: None,
-    }))
+    Ok(Some(parse_wasm_metadata(stdout)?))
 }
 
 fn execute_metadata_query(program: &WasmProgram, args: &[&[u8]]) -> Result<ExecutionOutput> {
@@ -1286,29 +1261,6 @@ mod tests {
         wat::parse_str(wat).expect("valid wat")
     }
 
-    fn repository_wasm(repository: &str) -> Vec<u8> {
-        wat_bytes(&format!(
-            r#"
-            (module
-              (import "wasi_snapshot_preview1" "fd_write"
-                (func $fd_write (param i32 i32 i32 i32) (result i32)))
-              (import "wasi_snapshot_preview1" "args_sizes_get"
-                (func $args_sizes_get (param i32 i32) (result i32)))
-              (memory (export "memory") 1)
-              (data (i32.const 64) "{repository}")
-              (func (export "_start")
-                (drop (call $args_sizes_get (i32.const 0) (i32.const 4)))
-                (if (i32.gt_u (i32.load (i32.const 0)) (i32.const 1))
-                  (then
-                    (i32.store (i32.const 8) (i32.const 64))
-                    (i32.store (i32.const 12) (i32.const {len}))
-                    (drop (call $fd_write
-                      (i32.const 1) (i32.const 8) (i32.const 1) (i32.const 16)))))))
-            "#,
-            len = repository.len()
-        ))
-    }
-
     fn metadata_wasm(metadata: &str) -> Vec<u8> {
         wat_bytes(&format!(
             r#"
@@ -1363,18 +1315,9 @@ mod tests {
     }
 
     #[test]
-    fn wasm_repository_is_absent_by_default() {
+    fn wasm_metadata_is_absent_by_default() {
         let wasm = wat_bytes(r#"(module (func (export "_start")))"#);
-        assert_eq!(query_wasm_repository(&wasm).unwrap(), None);
-    }
-
-    #[test]
-    fn wasm_repository_query_runs_with_repository_arg() {
-        let wasm = repository_wasm("Owner/Repo_Name");
-        assert_eq!(
-            query_wasm_repository(&wasm).unwrap(),
-            Some("owner/repo_name".to_owned())
-        );
+        assert_eq!(query_wasm_metadata(&wasm).unwrap(), None);
     }
 
     #[test]
@@ -1402,9 +1345,11 @@ mod tests {
     }
 
     #[test]
-    fn wasm_repository_query_rejects_invalid_repository() {
-        let wasm = repository_wasm("bad owner/repo");
-        assert!(query_wasm_repository(&wasm).is_err());
+    fn wasm_metadata_query_rejects_invalid_repository() {
+        let wasm = metadata_wasm(
+            r#"{"github_repository":"bad owner/repo","component_name":"api","version":"1.2.3"}"#,
+        );
+        assert!(query_wasm_metadata(&wasm).is_err());
     }
 
     #[test]
