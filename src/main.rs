@@ -521,6 +521,8 @@ fn run_corpus_program(
     )
     .with_context(|| format!("failed to prepare {}", download.program.program_hash))?;
     let mut fuel_spent = 0u64;
+    let mut uploaded_observations = 0u64;
+    let mut skipped_observations = 0u64;
     eprintln!(
         "program_start={} repository={} fuel_budget={} initial_estimate={:.3}",
         download.program.program_hash,
@@ -540,18 +542,11 @@ fn run_corpus_program(
             .get(&bucket)
             .is_some_and(|previous| observation_hash >= previous)
         {
-            eprintln!(
-                "skipped_observation={} bucket={} previous_observation_hash={}",
-                proof.program_hash,
-                bucket,
-                bucket_witnesses
-                    .get(&bucket)
-                    .map(String::as_str)
-                    .unwrap_or("-")
-            );
+            skipped_observations = skipped_observations.saturating_add(1);
         } else {
             submit_proof_record(client, api_url, &proof)?;
             bucket_witnesses.insert(bucket, observation_hash.clone());
+            uploaded_observations = uploaded_observations.saturating_add(1);
         }
         if result.fuel_consumed == 0 {
             eprintln!("program_zero_fuel={}", session.program_hash());
@@ -559,9 +554,11 @@ fn run_corpus_program(
         }
     }
     eprintln!(
-        "program_done={} fuel_spent={} estimated_observations={:.3}",
+        "program_done={} fuel_spent={} uploaded_observations={} skipped_observations={} estimated_observations={:.3}",
         session.program_hash(),
         fuel_spent,
+        uploaded_observations,
+        skipped_observations,
         session.stats().estimated_observations
     );
     Ok(())

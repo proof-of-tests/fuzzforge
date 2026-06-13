@@ -726,7 +726,7 @@ fn corpus_skips_observations_that_do_not_improve_central_proof() {
     let _ = corpus.kill();
     let output = corpus.wait_with_output().expect("corpus output");
     assert!(!stdout(&output).contains("submitted_observation="));
-    assert!(stderr(&output).contains("skipped_observation="));
+    assert!(stderr(&output).contains("skipped_observations=1"));
     assert!(requests.iter().all(|request| request.0 != "POST"));
 }
 
