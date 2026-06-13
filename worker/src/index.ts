@@ -32,6 +32,8 @@ interface BucketRow {
 interface ProgramRow {
   program_hash: string;
   github_repository: string | null;
+  component_name: string | null;
+  version: string | null;
   github_verified_by: string | null;
   github_verified_at: string | null;
   wasm_bytes: number;
@@ -50,8 +52,16 @@ interface GitHubRepository {
   };
 }
 
+interface WasmMetadata {
+  github_repository: string | null;
+  component_name: string | null;
+  version: string | null;
+}
+
 const HASH_RE = /^[0-9a-f]{64}$/;
 const GITHUB_REPO_RE = /^[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?\/[a-z0-9._-]{1,100}$/;
+const SEMVER_RE =
+  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/;
 const HLL_PRECISION = 6;
 const HLL_BUCKETS = 1 << HLL_PRECISION;
 const MAX_STREAM_INTERVAL_MS = 10_000;
@@ -70,7 +80,7 @@ type VerifierExports = {
   ff_alloc(len: number): number;
   ff_dealloc(ptr: number, len: number): void;
   ff_hash_hex(wasmPtr: number, wasmLen: number, outPtr: number, outLen: number): number;
-  ff_repository(wasmPtr: number, wasmLen: number, outPtr: number, outLen: number): number;
+  ff_metadata(wasmPtr: number, wasmLen: number, outPtr: number, outLen: number): number;
   ff_verify(wasmPtr: number, wasmLen: number, recordPtr: number, recordLen: number): number;
 };
 
@@ -160,7 +170,8 @@ async function putWasm(request: Request, env: Env, programHash: string): Promise
   if (actualHash !== programHash) {
     throw new HttpError(400, "wasm_hash_mismatch");
   }
-  const githubRepository = await queryWasmRepository(bytes);
+  const metadata = await queryWasmMetadata(bytes);
+  const githubRepository = metadata.github_repository;
   const githubVerifiedBy =
     githubRepository === null
       ? null
@@ -168,10 +179,7 @@ async function putWasm(request: Request, env: Env, programHash: string): Promise
 
   await env.WASM_BUCKET.put(wasmKey(programHash), bytes, {
     httpMetadata: { contentType: "application/wasm" },
-    customMetadata:
-      githubRepository === null
-        ? { programHash }
-        : { programHash, githubRepository },
+    customMetadata: wasmCustomMetadata(programHash, metadata),
   });
 
   const now = new Date().toISOString();
@@ -179,15 +187,19 @@ async function putWasm(request: Request, env: Env, programHash: string): Promise
     `INSERT INTO programs (
       program_hash,
       github_repository,
+      component_name,
+      version,
       github_verified_by,
       github_verified_at,
       wasm_bytes,
       created_at,
       updated_at
     )
-     VALUES (?, ?, ?, ?, ?, ?, ?)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(program_hash) DO UPDATE SET
       github_repository = excluded.github_repository,
+      component_name = excluded.component_name,
+      version = excluded.version,
       github_verified_by = excluded.github_verified_by,
       github_verified_at = excluded.github_verified_at,
       wasm_bytes = excluded.wasm_bytes,
@@ -196,6 +208,8 @@ async function putWasm(request: Request, env: Env, programHash: string): Promise
     .bind(
       programHash,
       githubRepository,
+      metadata.component_name,
+      metadata.version,
       githubVerifiedBy,
       githubRepository === null ? null : now,
       bytes.byteLength,
@@ -208,6 +222,8 @@ async function putWasm(request: Request, env: Env, programHash: string): Promise
     program_hash: programHash,
     bytes: bytes.byteLength,
     github_repository: githubRepository,
+    component_name: metadata.component_name,
+    version: metadata.version,
     github_verified_by: githubVerifiedBy,
   });
 }
@@ -230,6 +246,8 @@ async function getProgram(env: Env, programHash: string): Promise<Response> {
     `SELECT
       program_hash,
       github_repository,
+      component_name,
+      version,
       github_verified_by,
       github_verified_at,
       wasm_bytes,
@@ -459,27 +477,78 @@ async function verifyGitHubRepositoryAccess(
   return user.login;
 }
 
-async function queryWasmRepository(wasm: ArrayBuffer): Promise<string | null> {
+async function queryWasmMetadata(wasm: ArrayBuffer): Promise<WasmMetadata> {
   const exports = await verifierExports();
   const wasmBytes = new Uint8Array(wasm);
   const wasmPtr = copyIntoVerifier(exports, wasmBytes);
-  const outPtr = exports.ff_alloc(256);
+  const outLen = 4096;
+  const outPtr = exports.ff_alloc(outLen);
   try {
-    const len = exports.ff_repository(wasmPtr, wasmBytes.byteLength, outPtr, 256);
+    const len = exports.ff_metadata(wasmPtr, wasmBytes.byteLength, outPtr, outLen);
     if (len < 0) {
-      throw new HttpError(400, VERIFY_CODES[-len] ?? "repository_query_failed");
+      throw new HttpError(400, VERIFY_CODES[-len] ?? "metadata_query_failed");
     }
     if (len === 0) {
-      return null;
+      return { github_repository: null, component_name: null, version: null };
     }
-    const repository = new TextDecoder().decode(
+    const metadata = new TextDecoder().decode(
       new Uint8Array(exports.memory.buffer, outPtr, len),
     );
-    return normalizeGitHubRepository(repository);
+    return parseWasmMetadata(metadata);
   } finally {
     exports.ff_dealloc(wasmPtr, wasmBytes.byteLength);
-    exports.ff_dealloc(outPtr, 256);
+    exports.ff_dealloc(outPtr, outLen);
   }
+}
+
+function parseWasmMetadata(value: string): WasmMetadata {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new HttpError(400, "invalid_wasm_metadata");
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new HttpError(400, "invalid_wasm_metadata");
+  }
+
+  const raw = parsed as Record<string, unknown>;
+  const githubRepository = optionalString(raw.github_repository, "invalid_wasm_repository");
+  const componentName = optionalString(raw.component_name, "invalid_wasm_component_name");
+  const version = optionalString(raw.version, "invalid_wasm_version");
+  if (version !== null && !SEMVER_RE.test(version)) {
+    throw new HttpError(400, "invalid_wasm_version");
+  }
+
+  return {
+    github_repository:
+      githubRepository === null || githubRepository.trim() === ""
+        ? null
+        : normalizeGitHubRepository(githubRepository),
+    component_name: componentName,
+    version,
+  };
+}
+
+function optionalString(value: unknown, error: string): string | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (typeof value !== "string") {
+    throw new HttpError(400, error);
+  }
+  return value;
+}
+
+function wasmCustomMetadata(programHash: string, metadata: WasmMetadata): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries({
+      programHash,
+      githubRepository: metadata.github_repository,
+      componentName: metadata.component_name,
+      version: metadata.version,
+    }).filter((entry): entry is [string, string] => entry[1] !== null),
+  );
 }
 
 function githubHeaders(token: string): HeadersInit {

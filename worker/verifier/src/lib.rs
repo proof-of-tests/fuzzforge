@@ -12,7 +12,7 @@ const SUPPORTED_VERIFIER_VERSIONS: [u32; 1] = [1];
 const DEFAULT_FUEL: u64 = 10_000_000;
 const DEFAULT_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 const WASI_MODULE: &str = "wasi_snapshot_preview1";
-const REPOSITORY_QUERY_ARGS: [&[u8]; 2] = [b"fuzzforge", b"--repository"];
+const METADATA_QUERY_ARGS: [&[u8]; 2] = [b"fuzzforge", b"--metadata"];
 const ERR_SUCCESS: i32 = 0;
 const ERR_BADF: i32 = 8;
 const ERR_FAULT: i32 = 21;
@@ -142,7 +142,7 @@ pub unsafe extern "C" fn ff_hash_hex(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ff_repository(
+pub unsafe extern "C" fn ff_metadata(
     wasm_ptr: *const u8,
     wasm_len: usize,
     out_ptr: *mut u8,
@@ -153,10 +153,10 @@ pub unsafe extern "C" fn ff_repository(
     }
     let wasm = unsafe { slice::from_raw_parts(wasm_ptr, wasm_len) };
     let out = unsafe { slice::from_raw_parts_mut(out_ptr, out_len) };
-    match query_repository(wasm) {
+    match query_metadata(wasm) {
         Ok(None) => VERIFY_OK,
-        Ok(Some(repository)) => {
-            let bytes = repository.as_bytes();
+        Ok(Some(metadata)) => {
+            let bytes = metadata.as_bytes();
             if bytes.len() > out.len() {
                 return -VERIFY_INVALID_INPUT;
             }
@@ -207,28 +207,38 @@ fn verify(wasm: &[u8], record_json: &[u8]) -> Result<(), i32> {
     Ok(())
 }
 
-fn query_repository(wasm: &[u8]) -> Result<Option<String>, i32> {
+fn query_metadata(wasm: &[u8]) -> Result<Option<String>, i32> {
     let program = WasmProgram::compile(wasm).map_err(|_| VERIFY_UNSUPPORTED_WASM)?;
     let output = program
         .execute_with_args(
             Vec::new(),
             verifier_version_config(1),
-            REPOSITORY_QUERY_ARGS
-                .iter()
-                .map(|arg| arg.to_vec())
-                .collect(),
+            METADATA_QUERY_ARGS.iter().map(|arg| arg.to_vec()).collect(),
         )
         .map_err(|_| VERIFY_OBSERVATION_MISMATCH)?;
-    if output.status != RunStatus::Success {
-        return Ok(None);
+    if output.status == RunStatus::Success {
+        let metadata = std::str::from_utf8(&output.stdout)
+            .map_err(|_| VERIFY_INVALID_RECORD)?
+            .trim();
+        if metadata.starts_with('{') {
+            validate_metadata_json(metadata)?;
+            return Ok(Some(metadata.to_owned()));
+        }
     }
-    let repository = std::str::from_utf8(&output.stdout)
-        .map_err(|_| VERIFY_INVALID_RECORD)?
-        .trim();
-    if repository.is_empty() {
-        return Ok(None);
+
+    Ok(None)
+}
+
+fn validate_metadata_json(metadata: &str) -> Result<(), i32> {
+    let value =
+        serde_json::from_str::<serde_json::Value>(metadata).map_err(|_| VERIFY_INVALID_RECORD)?;
+    let Some(object) = value.as_object() else {
+        return Err(VERIFY_INVALID_RECORD);
+    };
+    if !object.get("version").is_some_and(|value| value.is_string()) {
+        return Err(VERIFY_INVALID_RECORD);
     }
-    Ok(Some(repository.to_owned()))
+    Ok(())
 }
 
 impl WasmProgram {
