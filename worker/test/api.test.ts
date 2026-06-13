@@ -239,6 +239,27 @@ describe("fuzzforge worker api", () => {
     });
   });
 
+  test("updates fuel estimates from submitted proof invocations", async () => {
+    await uploadWasm();
+    await env.DB.prepare(
+      "UPDATE programs SET average_fuel_consumed = ?, fuel_samples = ? WHERE program_hash = ?",
+    )
+      .bind(1_000_000_000, 2, PROGRAM_HASH)
+      .run();
+
+    const response = await submitProof(proofRecord([OBSERVATIONS[0]]));
+    expect(response.status, await response.clone().text()).toBe(200);
+
+    const row = await env.DB.prepare(
+      "SELECT average_fuel_consumed, fuel_samples FROM programs WHERE program_hash = ?",
+    )
+      .bind(PROGRAM_HASH)
+      .first<{ average_fuel_consumed: number; fuel_samples: number }>();
+    expect(row?.fuel_samples).toBe(3);
+    expect(row?.average_fuel_consumed).toBeGreaterThan(0);
+    expect(row?.average_fuel_consumed).toBeLessThan(1_000_000_000);
+  });
+
   test("lists stored programs and filters to associated programs", async () => {
     await uploadWasm();
     mockGitHubRepositoryPermissions({ pull: true, push: true, admin: false });

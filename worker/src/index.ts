@@ -64,6 +64,11 @@ interface WasmMetadata {
   version: string | null;
 }
 
+interface ProofVerificationReport {
+  fuel_consumed: number;
+  invocations: number;
+}
+
 const HASH_RE = /^[0-9a-f]{64}$/;
 const SEED_RE = /^(?:[0-9a-f]{2})+$/;
 const GITHUB_REPO_RE = /^[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?\/[a-z0-9._-]{1,100}$/;
@@ -89,7 +94,14 @@ type VerifierExports = {
   ff_hash_hex(wasmPtr: number, wasmLen: number, outPtr: number, outLen: number): number;
   ff_metadata(wasmPtr: number, wasmLen: number, outPtr: number, outLen: number): number;
   ff_estimate_fuel(wasmPtr: number, wasmLen: number, outPtr: number, outLen: number): number;
-  ff_verify(wasmPtr: number, wasmLen: number, recordPtr: number, recordLen: number): number;
+  ff_verify(
+    wasmPtr: number,
+    wasmLen: number,
+    recordPtr: number,
+    recordLen: number,
+    outPtr: number,
+    outLen: number,
+  ): number;
 };
 
 let verifierPromise: Promise<VerifierExports> | undefined;
@@ -359,9 +371,11 @@ async function putProof(request: Request, env: Env, programHash: string): Promis
     throw new HttpError(404, "wasm_not_found");
   }
   const wasm = await wasmObject.arrayBuffer();
-  await verifyProof(wasm, record);
+  const verification = await verifyProof(wasm, record);
 
-  const statements: D1PreparedStatement[] = [];
+  const statements: D1PreparedStatement[] = [
+    fuelEstimateUpdateStatement(env, programHash, verification),
+  ];
 
   for (const observation of record.buckets) {
     if (observation === null) {
@@ -396,13 +410,36 @@ async function putProof(request: Request, env: Env, programHash: string): Promis
   await env.DB.batch(statements);
   const proof = await loadProof(env, programHash);
   const bucketWitnesses = proof.buckets.filter((bucket) => bucket !== null).length;
-  const verifiedWitnesses = record.buckets.filter((bucket) => bucket !== null).length;
   return json({
     program_hash: programHash,
     bucket_witnesses: bucketWitnesses,
     estimated_observations: estimate(bucketsToRegisters(proof.buckets)),
-    verified_observations: verifiedWitnesses,
+    verified_observations: verification.invocations,
   });
+}
+
+function fuelEstimateUpdateStatement(
+  env: Env,
+  programHash: string,
+  verification: ProofVerificationReport,
+): D1PreparedStatement {
+  return env.DB.prepare(
+    `UPDATE programs
+     SET
+      average_fuel_consumed =
+        ((COALESCE(average_fuel_consumed, 0) * fuel_samples) + ?) /
+        (fuel_samples + ?),
+      fuel_samples = fuel_samples + ?,
+      updated_at = ?
+     WHERE program_hash = ?`,
+  )
+    .bind(
+      verification.fuel_consumed,
+      verification.invocations,
+      verification.invocations,
+      new Date().toISOString(),
+      programHash,
+    );
 }
 
 async function getProof(env: Env, programHash: string): Promise<Response> {
@@ -708,25 +745,46 @@ async function hashWasm(wasm: ArrayBuffer): Promise<string> {
   }
 }
 
-async function verifyProof(wasm: ArrayBuffer, record: HllRecord): Promise<void> {
+async function verifyProof(
+  wasm: ArrayBuffer,
+  record: HllRecord,
+): Promise<ProofVerificationReport> {
   const exports = await verifierExports();
   const wasmBytes = new Uint8Array(wasm);
   const recordBytes = new TextEncoder().encode(JSON.stringify(record));
   const wasmPtr = copyIntoVerifier(exports, wasmBytes);
   const recordPtr = copyIntoVerifier(exports, recordBytes);
+  const outLen = 16;
+  const outPtr = exports.ff_alloc(outLen);
   try {
     const code = exports.ff_verify(
       wasmPtr,
       wasmBytes.byteLength,
       recordPtr,
       recordBytes.byteLength,
+      outPtr,
+      outLen,
     );
     if (code !== 0) {
       throw new HttpError(400, VERIFY_CODES[code] ?? "verifier_error");
     }
+    const view = new DataView(exports.memory.buffer, outPtr, outLen);
+    const fuelConsumed = view.getBigUint64(0, true);
+    const invocations = view.getBigUint64(8, true);
+    if (
+      fuelConsumed > BigInt(Number.MAX_SAFE_INTEGER) ||
+      invocations > BigInt(Number.MAX_SAFE_INTEGER)
+    ) {
+      throw new HttpError(400, "proof_fuel_too_large");
+    }
+    return {
+      fuel_consumed: Number(fuelConsumed),
+      invocations: Number(invocations),
+    };
   } finally {
     exports.ff_dealloc(wasmPtr, wasmBytes.byteLength);
     exports.ff_dealloc(recordPtr, recordBytes.byteLength);
+    exports.ff_dealloc(outPtr, outLen);
   }
 }
 
