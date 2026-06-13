@@ -1006,13 +1006,13 @@ fn ensure_success_ref(response: &reqwest::blocking::Response, action: &str) -> R
 
 #[derive(Debug, Deserialize)]
 struct RateEvent {
-    total_tests: u64,
+    total_tests: f64,
     timestamp_ms: u64,
 }
 
 struct RateTracker {
     window: Duration,
-    samples: std::collections::VecDeque<(u64, u64)>,
+    samples: std::collections::VecDeque<(u64, f64)>,
 }
 
 impl RateTracker {
@@ -1023,7 +1023,7 @@ impl RateTracker {
         }
     }
 
-    fn update(&mut self, total_tests: u64, timestamp_ms: u64) -> Option<f64> {
+    fn update(&mut self, total_tests: f64, timestamp_ms: u64) -> Option<f64> {
         self.samples.push_back((timestamp_ms, total_tests));
         let window_ms = self.window.as_millis() as u64;
         while self
@@ -1038,8 +1038,8 @@ impl RateTracker {
         if elapsed_ms == 0 {
             return Some(0.0);
         }
-        let added = total_tests.saturating_sub(first_total);
-        Some(added as f64 / (elapsed_ms as f64 / 1000.0))
+        let added = (total_tests - first_total).max(0.0);
+        Some(added / (elapsed_ms as f64 / 1000.0))
     }
 }
 
