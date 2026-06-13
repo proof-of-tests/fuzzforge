@@ -67,6 +67,8 @@ describe("fuzzforge worker api", () => {
       version: null,
       github_verified_by: null,
       wasm_bytes: WASM.byteLength,
+      average_fuel_consumed: expect.any(Number),
+      fuel_samples: 1,
     });
   });
 
@@ -174,7 +176,7 @@ describe("fuzzforge worker api", () => {
     });
 
     const row = await env.DB.prepare(
-      "SELECT github_repository, component_name, version, github_verified_by, wasm_bytes FROM programs WHERE program_hash = ?",
+      "SELECT github_repository, component_name, version, github_verified_by, wasm_bytes, average_fuel_consumed, fuel_samples FROM programs WHERE program_hash = ?",
     )
       .bind(ASSOCIATED_PROGRAM_HASH)
       .first<{
@@ -183,13 +185,57 @@ describe("fuzzforge worker api", () => {
         version: string | null;
         github_verified_by: string;
         wasm_bytes: number;
+        average_fuel_consumed: number;
+        fuel_samples: number;
       }>();
-    expect(row).toEqual({
+    expect(row).toMatchObject({
       github_repository: "owner/repo",
       component_name: "api",
       version: "1.2.3",
       github_verified_by: "alice",
       wasm_bytes: ASSOCIATED_WASM.byteLength,
+      average_fuel_consumed: expect.any(Number),
+      fuel_samples: 1,
+    });
+    expect(row!.average_fuel_consumed).toBeGreaterThan(0);
+  });
+
+  test("records one initial fuel sample for uploaded wasm", async () => {
+    const put = await uploadWasm();
+    const body = (await put.json()) as {
+      average_fuel_consumed: number;
+      fuel_samples: number;
+    };
+    expect(body.average_fuel_consumed).toBeGreaterThan(0);
+    expect(body.fuel_samples).toBe(1);
+
+    const row = await env.DB.prepare(
+      "SELECT average_fuel_consumed, fuel_samples FROM programs WHERE program_hash = ?",
+    )
+      .bind(PROGRAM_HASH)
+      .first<{ average_fuel_consumed: number; fuel_samples: number }>();
+    expect(row).toEqual({
+      average_fuel_consumed: body.average_fuel_consumed,
+      fuel_samples: body.fuel_samples,
+    });
+  });
+
+  test("does not reset existing fuel estimates when wasm is uploaded again", async () => {
+    await uploadWasm();
+    await env.DB.prepare(
+      "UPDATE programs SET average_fuel_consumed = ?, fuel_samples = ? WHERE program_hash = ?",
+    )
+      .bind(123.5, 2, PROGRAM_HASH)
+      .run();
+
+    const put = await SELF.fetch(`https://example.com/api/programs/${PROGRAM_HASH}/wasm`, {
+      method: "PUT",
+      body: WASM,
+    });
+    expect(put.status, await put.clone().text()).toBe(200);
+    await expect(put.json()).resolves.toMatchObject({
+      average_fuel_consumed: 123.5,
+      fuel_samples: 2,
     });
   });
 
@@ -399,10 +445,14 @@ async function uploadWasm() {
     body: WASM,
   });
   expect(put.status).toBe(200);
-  await expect(put.json()).resolves.toMatchObject({
+  const clone = put.clone();
+  await expect(clone.json()).resolves.toMatchObject({
     program_hash: PROGRAM_HASH,
     bytes: WASM.byteLength,
+    average_fuel_consumed: expect.any(Number),
+    fuel_samples: 1,
   });
+  return put;
 }
 
 function submitProof(record: unknown): Promise<Response> {

@@ -153,6 +153,12 @@ whose effective repository permissions include `push` or `admin`. Empty output
 or a non-success exit means the module is unassociated and the upload remains
 unauthenticated.
 
+After metadata validation, the Worker runs one verifier-version test iteration
+with a fixed 32-byte zero seed and stores the consumed fuel as
+`average_fuel_consumed` with `fuel_samples = 1`. Re-uploading the same program
+does not reset existing fuel samples, so later random-seed sampling can refine
+the average.
+
 Proof uploads are verified inside the Worker with a Rust/wasmi verifier compiled
 to WASM: each submitted bucket witness is rerun against the stored WASM, and
 only newly verified witnesses are merged into the server-owned HLL buckets.
