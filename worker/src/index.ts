@@ -36,6 +36,8 @@ interface ProgramRow {
   github_verified_by: string | null;
   github_verified_at: string | null;
   wasm_bytes: number;
+  average_fuel_consumed: number | null;
+  fuel_samples: number;
   created_at: string;
   updated_at: string;
 }
@@ -86,6 +88,7 @@ type VerifierExports = {
   ff_dealloc(ptr: number, len: number): void;
   ff_hash_hex(wasmPtr: number, wasmLen: number, outPtr: number, outLen: number): number;
   ff_metadata(wasmPtr: number, wasmLen: number, outPtr: number, outLen: number): number;
+  ff_estimate_fuel(wasmPtr: number, wasmLen: number, outPtr: number, outLen: number): number;
   ff_verify(wasmPtr: number, wasmLen: number, recordPtr: number, recordLen: number): number;
 };
 
@@ -182,6 +185,7 @@ async function putWasm(request: Request, env: Env, programHash: string): Promise
     throw new HttpError(400, "wasm_hash_mismatch");
   }
   const metadata = await queryWasmMetadata(bytes);
+  const fuelConsumed = await estimateInitialFuel(bytes);
   const githubRepository = metadata.github_repository;
   const githubVerifiedBy =
     githubRepository === null
@@ -203,10 +207,12 @@ async function putWasm(request: Request, env: Env, programHash: string): Promise
       github_verified_by,
       github_verified_at,
       wasm_bytes,
+      average_fuel_consumed,
+      fuel_samples,
       created_at,
       updated_at
     )
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(program_hash) DO UPDATE SET
       github_repository = excluded.github_repository,
       component_name = excluded.component_name,
@@ -214,6 +220,14 @@ async function putWasm(request: Request, env: Env, programHash: string): Promise
       github_verified_by = excluded.github_verified_by,
       github_verified_at = excluded.github_verified_at,
       wasm_bytes = excluded.wasm_bytes,
+      average_fuel_consumed = CASE
+        WHEN programs.fuel_samples = 0 THEN excluded.average_fuel_consumed
+        ELSE programs.average_fuel_consumed
+      END,
+      fuel_samples = CASE
+        WHEN programs.fuel_samples = 0 THEN excluded.fuel_samples
+        ELSE programs.fuel_samples
+      END,
       updated_at = excluded.updated_at`,
   )
     .bind(
@@ -224,18 +238,26 @@ async function putWasm(request: Request, env: Env, programHash: string): Promise
       githubVerifiedBy,
       githubRepository === null ? null : now,
       bytes.byteLength,
+      fuelConsumed,
+      1,
       now,
       now,
     )
     .run();
 
+  const row = await loadProgramRow(env, programHash);
+  if (!row) {
+    throw new HttpError(500, "program_not_stored");
+  }
   return json({
     program_hash: programHash,
     bytes: bytes.byteLength,
-    github_repository: githubRepository,
-    component_name: metadata.component_name,
-    version: metadata.version,
-    github_verified_by: githubVerifiedBy,
+    github_repository: row.github_repository,
+    component_name: row.component_name,
+    version: row.version,
+    github_verified_by: row.github_verified_by,
+    average_fuel_consumed: row.average_fuel_consumed,
+    fuel_samples: row.fuel_samples,
   });
 }
 
@@ -253,7 +275,15 @@ async function getWasm(env: Env, programHash: string): Promise<Response> {
 }
 
 async function getProgram(env: Env, programHash: string): Promise<Response> {
-  const row = await env.DB.prepare(
+  const row = await loadProgramRow(env, programHash);
+  if (!row) {
+    throw new HttpError(404, "program_not_found");
+  }
+  return json(row);
+}
+
+async function loadProgramRow(env: Env, programHash: string): Promise<ProgramRow | null> {
+  return env.DB.prepare(
     `SELECT
       program_hash,
       github_repository,
@@ -262,6 +292,8 @@ async function getProgram(env: Env, programHash: string): Promise<Response> {
       github_verified_by,
       github_verified_at,
       wasm_bytes,
+      average_fuel_consumed,
+      fuel_samples,
       created_at,
       updated_at
      FROM programs
@@ -269,10 +301,6 @@ async function getProgram(env: Env, programHash: string): Promise<Response> {
   )
     .bind(programHash)
     .first<ProgramRow>();
-  if (!row) {
-    throw new HttpError(404, "program_not_found");
-  }
-  return json(row);
 }
 
 async function listPrograms(url: URL, env: Env): Promise<Response> {
@@ -303,6 +331,8 @@ async function listPrograms(url: URL, env: Env): Promise<Response> {
       github_verified_by,
       github_verified_at,
       wasm_bytes,
+      average_fuel_consumed,
+      fuel_samples,
       created_at,
       updated_at
      FROM programs
@@ -554,6 +584,31 @@ async function queryWasmMetadata(wasm: ArrayBuffer): Promise<WasmMetadata> {
       new Uint8Array(exports.memory.buffer, outPtr, len),
     );
     return parseWasmMetadata(metadata);
+  } finally {
+    exports.ff_dealloc(wasmPtr, wasmBytes.byteLength);
+    exports.ff_dealloc(outPtr, outLen);
+  }
+}
+
+async function estimateInitialFuel(wasm: ArrayBuffer): Promise<number> {
+  const exports = await verifierExports();
+  const wasmBytes = new Uint8Array(wasm);
+  const wasmPtr = copyIntoVerifier(exports, wasmBytes);
+  const outLen = 8;
+  const outPtr = exports.ff_alloc(outLen);
+  try {
+    const code = exports.ff_estimate_fuel(wasmPtr, wasmBytes.byteLength, outPtr, outLen);
+    if (code !== 0) {
+      throw new HttpError(400, VERIFY_CODES[code] ?? "fuel_estimate_failed");
+    }
+    const fuelConsumed = new DataView(exports.memory.buffer, outPtr, outLen).getBigUint64(
+      0,
+      true,
+    );
+    if (fuelConsumed > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new HttpError(400, "fuel_estimate_too_large");
+    }
+    return Number(fuelConsumed);
   } finally {
     exports.ff_dealloc(wasmPtr, wasmBytes.byteLength);
     exports.ff_dealloc(outPtr, outLen);

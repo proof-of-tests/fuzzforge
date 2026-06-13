@@ -13,6 +13,7 @@ const DEFAULT_FUEL: u64 = 10_000_000;
 const DEFAULT_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 const WASI_MODULE: &str = "wasi_snapshot_preview1";
 const METADATA_QUERY_ARGS: [&[u8]; 2] = [b"fuzzforge", b"--metadata"];
+const INITIAL_FUEL_ESTIMATE_SEED: [u8; 32] = [0; 32];
 const ERR_SUCCESS: i32 = 0;
 const ERR_BADF: i32 = 8;
 const ERR_FAULT: i32 = 21;
@@ -163,6 +164,27 @@ pub unsafe extern "C" fn ff_metadata(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn ff_estimate_fuel(
+    wasm_ptr: *const u8,
+    wasm_len: usize,
+    out_ptr: *mut u8,
+    out_len: usize,
+) -> i32 {
+    if wasm_ptr.is_null() || out_ptr.is_null() || out_len < 8 {
+        return VERIFY_INVALID_INPUT;
+    }
+    let wasm = unsafe { slice::from_raw_parts(wasm_ptr, wasm_len) };
+    let out = unsafe { slice::from_raw_parts_mut(out_ptr, out_len) };
+    match estimate_fuel(wasm) {
+        Ok(fuel_consumed) => {
+            out[..8].copy_from_slice(&fuel_consumed.to_le_bytes());
+            VERIFY_OK
+        }
+        Err(code) => code,
+    }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ff_verify(
     wasm_ptr: *const u8,
     wasm_len: usize,
@@ -178,6 +200,17 @@ pub unsafe extern "C" fn ff_verify(
         Ok(()) => VERIFY_OK,
         Err(code) => code,
     }
+}
+
+fn estimate_fuel(wasm: &[u8]) -> Result<u64, i32> {
+    let program = WasmProgram::compile(wasm).map_err(|_| VERIFY_UNSUPPORTED_WASM)?;
+    let output = program
+        .execute(
+            INITIAL_FUEL_ESTIMATE_SEED.to_vec(),
+            verifier_version_config(1),
+        )
+        .map_err(|_| VERIFY_OBSERVATION_MISMATCH)?;
+    Ok(output.fuel_consumed)
 }
 
 fn verify(wasm: &[u8], record_json: &[u8]) -> Result<(), i32> {
