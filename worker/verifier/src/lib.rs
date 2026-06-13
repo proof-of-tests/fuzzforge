@@ -230,8 +230,8 @@ fn query_metadata(wasm: &[u8]) -> Result<Option<String>, i32> {
 }
 
 fn validate_metadata_json(metadata: &str) -> Result<(), i32> {
-    let value = serde_json::from_str::<serde_json::Value>(metadata)
-        .map_err(|_| VERIFY_INVALID_RECORD)?;
+    let value =
+        serde_json::from_str::<serde_json::Value>(metadata).map_err(|_| VERIFY_INVALID_RECORD)?;
     let Some(object) = value.as_object() else {
         return Err(VERIFY_INVALID_RECORD);
     };
