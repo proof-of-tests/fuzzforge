@@ -341,6 +341,55 @@ fn save_fuel_interval_must_be_nonzero() {
 }
 
 #[test]
+fn rate_accepts_fractional_total_tests() {
+    let _guard = HTTP_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (server, api_url) = test_server();
+    let server_thread = thread::spawn(move || {
+        let request = server.recv().expect("request");
+        assert_eq!(request.method().as_str(), "GET");
+        assert_eq!(request.url(), "/api/hash-results/stream");
+        request
+            .respond(
+                tiny_http::Response::from_string(concat!(
+                    "event: counter\n",
+                    "data: {\"total_tests\":52.907428683805946,\"timestamp_ms\":1000}\n",
+                    "\n",
+                    "event: counter\n",
+                    "data: {\"total_tests\":54.407428683805946,\"timestamp_ms\":2000}\n",
+                    "\n",
+                ))
+                .with_header(
+                    tiny_http::Header::from_bytes(
+                        b"content-type".as_slice(),
+                        b"text/event-stream".as_slice(),
+                    )
+                    .unwrap(),
+                ),
+            )
+            .expect("respond");
+    });
+
+    let rate = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
+        .args(["rate", "--api-url", &api_url, "--window-seconds=10"])
+        .output()
+        .expect("rate command");
+    server_thread.join().expect("server thread");
+
+    assert!(rate.status.success(), "stderr: {}", stderr(&rate));
+    let rate_stdout = stdout(&rate);
+    assert!(
+        rate_stdout.contains("total_tests=52.907428683805946 rate_per_second=0.000"),
+        "stdout: {rate_stdout}"
+    );
+    assert!(
+        rate_stdout.contains("total_tests=54.407428683805946 rate_per_second=1.500"),
+        "stdout: {rate_stdout}"
+    );
+}
+
+#[test]
 fn submit_uploads_wasm_and_proof() {
     let _guard = HTTP_TEST_LOCK
         .lock()
