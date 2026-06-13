@@ -82,7 +82,7 @@ enum Command {
         #[arg(long)]
         invoke: Option<String>,
 
-        /// Submit the WASM file and updated proof to a fuzzforge API base URL.
+        /// Submit the updated proof to a fuzzforge API base URL.
         #[arg(long, num_args = 0..=1, default_missing_value = DEFAULT_API_URL)]
         submit_url: Option<String>,
 
@@ -118,7 +118,21 @@ enum Command {
         store: PathBuf,
     },
 
-    /// Submit a stored HLL proof and its WASM file to a fuzzforge API.
+    /// Upload a WASM file to a fuzzforge API.
+    Upload {
+        /// Path to the WASM module.
+        wasm: PathBuf,
+
+        /// FuzzForge API base URL. Defaults to FUZZFORGE_API_URL or the public FuzzForge API.
+        #[arg(long)]
+        api_url: Option<String>,
+
+        /// HTTP timeout for WASM upload.
+        #[arg(long, default_value_t = DEFAULT_SUBMIT_TIMEOUT_SECONDS)]
+        timeout_seconds: u64,
+    },
+
+    /// Submit a stored HLL proof to a fuzzforge API.
     Submit {
         /// Path to the WASM module.
         wasm: PathBuf,
@@ -260,7 +274,6 @@ fn main() -> Result<()> {
             if let Some(api_url) = submit_url {
                 submit_proof(
                     &api_url,
-                    &wasm,
                     session.record(),
                     Duration::from_secs(submit_timeout_seconds),
                 )?;
@@ -317,6 +330,17 @@ fn main() -> Result<()> {
                 );
             }
         }
+        Command::Upload {
+            wasm,
+            api_url,
+            timeout_seconds,
+        } => {
+            let api_url = api_url_or_env(api_url)?;
+            if timeout_seconds == 0 {
+                anyhow::bail!("--timeout-seconds must be greater than zero");
+            }
+            upload_wasm(&api_url, &wasm, Duration::from_secs(timeout_seconds))?;
+        }
         Command::Submit {
             wasm,
             store,
@@ -332,12 +356,7 @@ fn main() -> Result<()> {
             let record = Store::new(store)
                 .load_or_new(&program_hash)
                 .with_context(|| format!("failed to load HLL record for {program_hash}"))?;
-            submit_proof(
-                &api_url,
-                &wasm,
-                &record,
-                Duration::from_secs(timeout_seconds),
-            )?;
+            submit_proof(&api_url, &record, Duration::from_secs(timeout_seconds))?;
         }
         Command::Corpus {
             api_url,
@@ -766,16 +785,10 @@ fn github_auth_login(api_url: &str, timeout: Duration) -> Result<()> {
     }
 }
 
-fn submit_proof(
-    api_url: &str,
-    wasm_path: &PathBuf,
-    record: &HllRecord,
-    timeout: Duration,
-) -> Result<()> {
-    record.validate()?;
-    ensure_submit_record_uses_current_verifier(record)?;
+fn upload_wasm(api_url: &str, wasm_path: &PathBuf, timeout: Duration) -> Result<()> {
     let wasm = fs::read(wasm_path)
         .with_context(|| format!("failed to read WASM module {}", wasm_path.display()))?;
+    let program_hash = hash_bytes_hex(&wasm);
     let github_repository = query_wasm_metadata(&wasm)
         .context("failed to query WASM metadata")?
         .and_then(|metadata| metadata.github_repository);
@@ -792,8 +805,7 @@ fn submit_proof(
         .build()
         .context("failed to build HTTP client")?;
     let base = api_url.trim_end_matches('/');
-    let wasm_url = format!("{base}/api/programs/{}/wasm", record.program_hash);
-    let proof_url = format!("{base}/api/programs/{}/proof", record.program_hash);
+    let wasm_url = format!("{base}/api/programs/{program_hash}/wasm");
 
     let mut wasm_request = client
         .put(&wasm_url)
@@ -806,7 +818,19 @@ fn submit_proof(
         .send()
         .with_context(|| format!("failed to upload WASM to {wasm_url}"))?;
     ensure_success(wasm_response, "WASM upload")?;
+    println!("uploaded_wasm={program_hash}");
+    Ok(())
+}
 
+fn submit_proof(api_url: &str, record: &HllRecord, timeout: Duration) -> Result<()> {
+    record.validate()?;
+    ensure_submit_record_uses_current_verifier(record)?;
+    let client = Client::builder()
+        .timeout(timeout)
+        .build()
+        .context("failed to build HTTP client")?;
+    let base = api_url.trim_end_matches('/');
+    let proof_url = format!("{base}/api/programs/{}/proof", record.program_hash);
     let proof_response = client
         .post(&proof_url)
         .json(record)
