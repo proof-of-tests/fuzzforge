@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use fuzzforge::{HllRecord, hash_bytes_hex, query_wasm_metadata};
+use fuzzforge::{HllRecord, StoredObservation, hash_bytes_hex, query_wasm_metadata};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 
@@ -149,22 +149,23 @@ pub(crate) fn upload_wasm(api_url: &str, wasm_path: &PathBuf, timeout: Duration)
 pub(crate) fn submit_proof(api_url: &str, record: &HllRecord, timeout: Duration) -> Result<()> {
     record.validate()?;
     ensure_submit_record_uses_current_verifier(record)?;
+    let observations: Vec<_> = record.bucket_witnesses().collect();
+    if observations.is_empty() {
+        anyhow::bail!("proof submission record has no observations");
+    }
     let client = Client::builder()
         .timeout(timeout)
         .build()
         .context("failed to build HTTP client")?;
     let base = api_url.trim_end_matches('/');
     let proof_url = format!("{base}/api/programs/{}/proof", record.program_hash);
-    let proof_response = client
-        .post(&proof_url)
-        .json(record)
-        .send()
-        .with_context(|| format!("failed to submit proof to {proof_url}"))?;
-    ensure_success(proof_response, "proof submission")?;
+    for observation in &observations {
+        submit_observation(&client, &proof_url, observation)?;
+    }
     println!(
         "submitted_proof={} stored_observations={}",
         record.program_hash,
-        record.bucket_witnesses().count()
+        observations.len()
     );
     Ok(())
 }
@@ -176,29 +177,39 @@ pub(crate) fn submit_proof_record(
 ) -> Result<()> {
     record.validate()?;
     ensure_submit_record_uses_current_verifier(record)?;
+    let observations: Vec<_> = record.bucket_witnesses().collect();
+    if observations.len() != 1 {
+        anyhow::bail!(
+            "proof submission record must contain exactly one observation; found {}",
+            observations.len()
+        );
+    }
     let proof_url = format!(
         "{}/api/programs/{}/proof",
         api_url.trim_end_matches('/'),
         record.program_hash
     );
-    let response = client
-        .post(&proof_url)
-        .json(record)
-        .send()
-        .with_context(|| format!("failed to submit proof to {proof_url}"))?;
-    ensure_success(response, "proof submission")?;
-    let observation_hash = record
-        .bucket_witnesses()
-        .next()
-        .context("proof submission record has no observation")?
-        .observation_hash
-        .as_str();
+    let observation = observations[0];
+    submit_observation(client, &proof_url, observation)?;
     println!(
         "submitted_observation={} stored_observations={}",
-        observation_hash,
+        observation.observation_hash,
         record.bucket_witnesses().count()
     );
     Ok(())
+}
+
+fn submit_observation(
+    client: &Client,
+    proof_url: &str,
+    observation: &StoredObservation,
+) -> Result<()> {
+    let response = client
+        .post(proof_url)
+        .json(observation)
+        .send()
+        .with_context(|| format!("failed to submit proof to {proof_url}"))?;
+    ensure_success(response, "proof submission")
 }
 
 pub(crate) fn ensure_success_ref(
