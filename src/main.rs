@@ -15,8 +15,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use fuzzforge::{
     DEFAULT_FUEL, DEFAULT_MEMORY_BYTES, DEFAULT_SAVE_FUEL_INTERVAL, DEFAULT_SEED_BYTES, HllRecord,
-    RunConfig, RunSession, Store, generate_seed, hash_wasm_file, query_wasm_metadata,
-    seed_from_hex, verify_wasm,
+    RunConfig, RunSession, Sketch, Store, generate_seed, hash_bytes_hex, hash_wasm_file,
+    query_wasm_metadata, seed_from_hex, verify_wasm,
 };
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -141,10 +141,6 @@ enum Command {
         #[arg(long)]
         api_url: Option<String>,
 
-        /// Store directory for downloaded WASM modules and HLL data.
-        #[arg(long, default_value = ".fuzzforge")]
-        store: PathBuf,
-
         /// Guest fuel to spend on each program before moving to the next one.
         #[arg(long, default_value_t = DEFAULT_CORPUS_FUEL_BUDGET)]
         fuel_budget: u64,
@@ -152,10 +148,6 @@ enum Command {
         /// Number of random seed bytes to generate for each run.
         #[arg(long, default_value_t = DEFAULT_SEED_BYTES)]
         seed_bytes: usize,
-
-        /// Persist HLL progress after this much guest fuel is consumed.
-        #[arg(long, default_value_t = DEFAULT_SAVE_FUEL_INTERVAL)]
-        save_fuel_interval: u64,
 
         /// HTTP timeout for program downloads and proof submissions.
         #[arg(long, default_value_t = DEFAULT_SUBMIT_TIMEOUT_SECONDS)]
@@ -360,19 +352,14 @@ fn main() -> Result<()> {
         }
         Command::Corpus {
             api_url,
-            store,
             fuel_budget,
             seed_bytes,
-            save_fuel_interval,
             timeout_seconds,
             cycles,
             cycle_sleep_seconds,
         } => {
             if fuel_budget == 0 {
                 anyhow::bail!("--fuel-budget must be greater than zero");
-            }
-            if save_fuel_interval == 0 {
-                anyhow::bail!("--save-fuel-interval must be greater than zero");
             }
             if timeout_seconds == 0 {
                 anyhow::bail!("--timeout-seconds must be greater than zero");
@@ -383,10 +370,8 @@ fn main() -> Result<()> {
             let api_url = api_url_or_env(api_url)?;
             run_corpus(
                 &api_url,
-                &store,
                 fuel_budget,
                 seed_bytes,
-                save_fuel_interval,
                 Duration::from_secs(timeout_seconds),
                 cycles,
                 Duration::from_secs(cycle_sleep_seconds),
@@ -408,10 +393,8 @@ fn main() -> Result<()> {
 
 fn run_corpus(
     api_url: &str,
-    store: &PathBuf,
     fuel_budget: u64,
     seed_bytes: usize,
-    save_fuel_interval: u64,
     timeout: Duration,
     cycles: Option<usize>,
     cycle_sleep: Duration,
@@ -430,7 +413,7 @@ fn run_corpus(
         );
         let mut downloads = Vec::with_capacity(programs.len());
         for program in programs {
-            match download_associated_program(&client, api_url, store, program) {
+            match download_associated_program(&client, api_url, program) {
                 Ok(Some(download)) => downloads.push(download),
                 Ok(None) => {}
                 Err(error) => eprintln!("download_error={error:#}"),
@@ -438,16 +421,8 @@ fn run_corpus(
         }
 
         for download in downloads {
-            run_corpus_program(
-                api_url,
-                store,
-                &download,
-                fuel_budget,
-                seed_bytes,
-                save_fuel_interval,
-                timeout,
-            )
-            .with_context(|| format!("failed to run {}", download.program.program_hash))?;
+            run_corpus_program(api_url, &client, &download, fuel_budget, seed_bytes)
+                .with_context(|| format!("failed to run {}", download.program.program_hash))?;
         }
 
         completed_cycles = completed_cycles.saturating_add(1);
@@ -490,7 +465,6 @@ fn list_associated_programs(client: &Client, api_url: &str) -> Result<Vec<Progra
 fn download_associated_program(
     client: &Client,
     api_url: &str,
-    store: &PathBuf,
     program: ProgramSummary,
 ) -> Result<Option<CorpusDownload>> {
     let base = api_url.trim_end_matches('/');
@@ -511,22 +485,7 @@ fn download_associated_program(
         return Ok(None);
     }
 
-    let wasm_dir = store.join("wasm");
-    fs::create_dir_all(&wasm_dir)
-        .with_context(|| format!("failed to create {}", wasm_dir.display()))?;
-    let wasm_path = wasm_dir.join(format!("{}.wasm", program.program_hash));
-    let tmp = wasm_path.with_extension(format!("wasm.tmp.{}", std::process::id()));
-    fs::write(&tmp, &wasm).with_context(|| format!("failed to write {}", tmp.display()))?;
-    fs::rename(&tmp, &wasm_path).with_context(|| {
-        format!(
-            "failed to rename {} to {}",
-            tmp.display(),
-            wasm_path.display()
-        )
-    })?;
-
-    let actual_hash = hash_wasm_file(&wasm_path)
-        .with_context(|| format!("failed to hash {}", wasm_path.display()))?;
+    let actual_hash = hash_bytes_hex(&wasm);
     if actual_hash != program.program_hash {
         anyhow::bail!(
             "downloaded WASM hash mismatch: expected {}, got {}",
@@ -535,49 +494,127 @@ fn download_associated_program(
         );
     }
 
-    Ok(Some(CorpusDownload { program, wasm_path }))
+    Ok(Some(CorpusDownload {
+        program,
+        wasm: wasm.to_vec(),
+    }))
 }
 
 fn run_corpus_program(
     api_url: &str,
-    store: &PathBuf,
+    client: &Client,
     download: &CorpusDownload,
     fuel_budget: u64,
     seed_bytes: usize,
-    save_fuel_interval: u64,
-    timeout: Duration,
 ) -> Result<()> {
-    let mut session = RunSession::from_wasm_path(&download.wasm_path, store, RunConfig::default())
-        .with_context(|| format!("failed to prepare {}", download.wasm_path.display()))?;
+    let initial_record = fetch_central_record(client, api_url, &download.program.program_hash)?;
+    let mut session = RunSession::from_wasm_bytes_with_record(
+        &download.wasm,
+        initial_record,
+        RunConfig::default(),
+    )
+    .with_context(|| format!("failed to prepare {}", download.program.program_hash))?;
     let mut fuel_spent = 0u64;
     eprintln!(
-        "program_start={} repository={} fuel_budget={}",
+        "program_start={} repository={} fuel_budget={} initial_estimate={:.3}",
         download.program.program_hash,
         download.program.github_repository.as_deref().unwrap_or("-"),
-        fuel_budget
+        fuel_budget,
+        session.stats().estimated_observations
     );
     while fuel_spent < fuel_budget {
         let result = session
             .run(generate_seed(seed_bytes)?)
-            .with_context(|| format!("failed to run {}", download.wasm_path.display()))?;
+            .with_context(|| format!("failed to run {}", download.program.program_hash))?;
         fuel_spent = fuel_spent.saturating_add(result.fuel_consumed);
-        session
-            .save_after_fuel(save_fuel_interval)
-            .with_context(|| format!("failed to save HLL record for {}", session.program_hash()))?;
+        let proof = single_observation_record(session.record())?;
+        submit_proof_record(client, api_url, &proof)?;
         if result.fuel_consumed == 0 {
             eprintln!("program_zero_fuel={}", session.program_hash());
             break;
         }
     }
-    session
-        .save_pending()
-        .with_context(|| format!("failed to save HLL record for {}", session.program_hash()))?;
-    submit_proof(api_url, &download.wasm_path, session.record(), timeout)?;
     eprintln!(
         "program_done={} fuel_spent={} estimated_observations={:.3}",
         session.program_hash(),
         fuel_spent,
         session.stats().estimated_observations
+    );
+    Ok(())
+}
+
+fn fetch_central_record(client: &Client, api_url: &str, program_hash: &str) -> Result<HllRecord> {
+    let proof_url = format!(
+        "{}/api/programs/{program_hash}/proof",
+        api_url.trim_end_matches('/')
+    );
+    let response = client
+        .get(&proof_url)
+        .send()
+        .with_context(|| format!("failed to fetch central proof from {proof_url}"))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(HllRecord::new(program_hash.to_owned()));
+    }
+    ensure_success_ref(&response, "central proof fetch")?;
+    let proof: CentralProof = response.json().context("failed to parse central proof")?;
+    if proof.program_hash != program_hash {
+        anyhow::bail!(
+            "central proof hash mismatch: expected {}, got {}",
+            program_hash,
+            proof.program_hash
+        );
+    }
+    if proof.schema_version != 2 {
+        anyhow::bail!("unsupported central proof schema {}", proof.schema_version);
+    }
+    if proof.precision != 6 {
+        anyhow::bail!("unsupported central proof precision {}", proof.precision);
+    }
+    let record = HllRecord {
+        schema_version: proof.schema_version,
+        program_hash: proof.program_hash,
+        precision: proof.precision,
+        run_count: proof.observations.len() as u64,
+        last_observation_hash: proof
+            .observations
+            .last()
+            .map(|observation| observation.observation_hash.clone()),
+        sketch: proof.sketch,
+        observations: Vec::new(),
+    };
+    record.validate()?;
+    Ok(record)
+}
+
+fn single_observation_record(record: &HllRecord) -> Result<HllRecord> {
+    let observation = record
+        .observations
+        .last()
+        .cloned()
+        .context("run did not produce an observation")?;
+    let mut proof = HllRecord::new(record.program_hash.clone());
+    proof.insert_observation(observation)?;
+    Ok(proof)
+}
+
+fn submit_proof_record(client: &Client, api_url: &str, record: &HllRecord) -> Result<()> {
+    record.validate()?;
+    ensure_submit_record_uses_current_verifier(record)?;
+    let proof_url = format!(
+        "{}/api/programs/{}/proof",
+        api_url.trim_end_matches('/'),
+        record.program_hash
+    );
+    let response = client
+        .post(&proof_url)
+        .json(record)
+        .send()
+        .with_context(|| format!("failed to submit proof to {proof_url}"))?;
+    ensure_success(response, "proof submission")?;
+    println!(
+        "submitted_observation={} stored_observations={}",
+        record.program_hash,
+        record.observations.len()
     );
     Ok(())
 }
@@ -847,9 +884,23 @@ struct ProgramSummary {
     github_repository: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CentralProof {
+    schema_version: u32,
+    program_hash: String,
+    precision: u8,
+    sketch: Sketch,
+    observations: Vec<CentralObservation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CentralObservation {
+    observation_hash: String,
+}
+
 struct CorpusDownload {
     program: ProgramSummary,
-    wasm_path: PathBuf,
+    wasm: Vec<u8>,
 }
 
 fn watch_rate(api_url: &str, window: Duration) -> Result<()> {

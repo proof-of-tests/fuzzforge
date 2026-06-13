@@ -544,18 +544,8 @@ fn corpus_downloads_associated_programs_runs_and_submits() {
     let _guard = HTTP_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let temp = tempdir().expect("tempdir");
-    let store_path = temp.path().join("store");
-    let config_path = temp.path().join("config");
     let wasm = associated_echo_wasm();
     let expected_hash = blake3::hash(&wasm).to_hex().to_string();
-    let token_dir = config_path.join("fuzzforge");
-    fs::create_dir_all(&token_dir).expect("create token dir");
-    fs::write(
-        token_dir.join("github.json"),
-        br#"{"access_token":"test-token","expires_at":4102444800}"#,
-    )
-    .expect("write token");
 
     let (server, api_url) = test_server();
     let (tx, rx) = mpsc::channel();
@@ -599,6 +589,18 @@ fn corpus_downloads_associated_programs_runs_and_submits() {
                             .unwrap(),
                         )
                     }
+                    ("GET", path) if path == format!("/api/programs/{expected_hash}/proof") => {
+                        tiny_http::Response::from_string(format!(
+                            r#"{{"schema_version":2,"program_hash":"{expected_hash}","precision":6,"sketch":{{"registers":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}},"observations":[]}}"#
+                        ))
+                        .with_header(
+                            tiny_http::Header::from_bytes(
+                                b"content-type".as_slice(),
+                                b"application/json".as_slice(),
+                            )
+                            .unwrap(),
+                        )
+                    }
                     _ => tiny_http::Response::from_string("{}").with_header(
                         tiny_http::Header::from_bytes(
                             b"content-type".as_slice(),
@@ -613,20 +615,17 @@ fn corpus_downloads_associated_programs_runs_and_submits() {
     });
 
     let corpus = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
-        .env("XDG_CONFIG_HOME", &config_path)
         .args([
             "corpus",
             "--api-url",
             &api_url,
-            "--store",
-            store_path.to_str().unwrap(),
             "--fuel-budget=1",
             "--cycles=1",
         ])
         .output()
         .expect("corpus command");
     assert!(corpus.status.success(), "stderr: {}", stderr(&corpus));
-    assert!(stdout(&corpus).contains(&format!("submitted_proof={expected_hash}")));
+    assert!(stdout(&corpus).contains(&format!("submitted_observation={expected_hash}")));
 
     let requests: Vec<_> = (0..4).map(|_| rx.recv().expect("request")).collect();
     server_thread.join().expect("server thread");
@@ -634,10 +633,11 @@ fn corpus_downloads_associated_programs_runs_and_submits() {
     assert_eq!(requests[0].1, "/api/programs?associated=true&limit=100");
     assert_eq!(requests[1].0, "GET");
     assert_eq!(requests[1].1, format!("/api/programs/{expected_hash}/wasm"));
-    assert_eq!(requests[2].0, "PUT");
-    assert_eq!(requests[2].1, format!("/api/programs/{expected_hash}/wasm"));
-    assert_eq!(requests[2].2, Some("Bearer test-token".to_owned()));
-    assert_eq!(requests[2].3, wasm);
+    assert_eq!(requests[2].0, "GET");
+    assert_eq!(
+        requests[2].1,
+        format!("/api/programs/{expected_hash}/proof")
+    );
     assert_eq!(requests[3].0, "POST");
     assert_eq!(
         requests[3].1,

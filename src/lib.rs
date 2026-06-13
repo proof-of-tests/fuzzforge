@@ -698,7 +698,7 @@ impl WasmProgram {
 
 pub struct RunSession {
     program: WasmProgram,
-    store: Store,
+    store: Option<Store>,
     record: HllRecord,
     config: RunConfig,
     unsaved_fuel: u64,
@@ -718,7 +718,31 @@ impl RunSession {
         let record = store.load_or_new(program.program_hash())?;
         Ok(Self {
             program,
-            store,
+            store: Some(store),
+            record,
+            config,
+            unsaved_fuel: 0,
+            has_unsaved_observations: false,
+        })
+    }
+
+    pub fn from_wasm_bytes_with_record(
+        wasm: &[u8],
+        record: HllRecord,
+        config: RunConfig,
+    ) -> Result<Self> {
+        record.validate()?;
+        let program = WasmProgram::compile(wasm)?;
+        if record.program_hash != program.program_hash() {
+            bail!(
+                "record hash mismatch: WASM is {}, record is {}",
+                program.program_hash(),
+                record.program_hash
+            );
+        }
+        Ok(Self {
+            program,
+            store: None,
             record,
             config,
             unsaved_fuel: 0,
@@ -765,7 +789,11 @@ impl RunSession {
     }
 
     pub fn save(&mut self) -> Result<()> {
-        self.store.save(&self.record)?;
+        let store = self
+            .store
+            .as_ref()
+            .context("run session does not have a local store")?;
+        store.save(&self.record)?;
         self.unsaved_fuel = 0;
         self.has_unsaved_observations = false;
         Ok(())
