@@ -79,6 +79,8 @@ describe("fuzzforge worker api", () => {
     await expect(get.json()).resolves.toMatchObject({
       program_hash: PROGRAM_HASH,
       github_repository: null,
+      component_name: null,
+      version: null,
       github_verified_by: null,
       wasm_bytes: WASM.byteLength,
     });
@@ -182,16 +184,26 @@ describe("fuzzforge worker api", () => {
       program_hash: ASSOCIATED_PROGRAM_HASH,
       bytes: ASSOCIATED_WASM.byteLength,
       github_repository: "owner/repo",
+      component_name: null,
+      version: null,
       github_verified_by: "alice",
     });
 
     const row = await env.DB.prepare(
-      "SELECT github_repository, github_verified_by, wasm_bytes FROM programs WHERE program_hash = ?",
+      "SELECT github_repository, component_name, version, github_verified_by, wasm_bytes FROM programs WHERE program_hash = ?",
     )
       .bind(ASSOCIATED_PROGRAM_HASH)
-      .first<{ github_repository: string; github_verified_by: string; wasm_bytes: number }>();
+      .first<{
+        github_repository: string;
+        component_name: string | null;
+        version: string | null;
+        github_verified_by: string;
+        wasm_bytes: number;
+      }>();
     expect(row).toEqual({
       github_repository: "owner/repo",
+      component_name: null,
+      version: null,
       github_verified_by: "alice",
       wasm_bytes: ASSOCIATED_WASM.byteLength,
     });

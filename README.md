@@ -40,18 +40,30 @@ to `https://fuzzforge.lemmih.com`. Submitted proofs must use the current
 verifier version settings. Version 1 uses the default `fuel`, `memory_bytes`,
 and `_start` invocation.
 
-WASM modules can optionally associate themselves with a GitHub repository by
-handling a `--repository` argument. When run with that argument, the module
-should print `owner/repo` to stdout and exit successfully instead of running a
-fuzz test.
+WASM modules can optionally report FuzzForge metadata by handling a `--metadata`
+argument. When run with that argument, the module should print a JSON object to
+stdout and exit successfully instead of running a fuzz test:
+
+```json
+{
+  "github_repository": "owner/repo",
+  "component_name": "",
+  "version": "1.2.3"
+}
+```
+
+`github_repository` can be omitted, null, or empty for unassociated modules.
+`component_name` is optional and may be an empty string. `version` is required
+for `--metadata` responses and must be SemVer. Legacy modules can still handle
+`--repository` and print only `owner/repo`.
 
 Unassociated WASM uploads do not require authentication. Associated uploads
 require a GitHub App user token for a user with write or admin access to the
 reported repository. Run `fuzzforge auth login` before submitting associated
-WASM. Modules that do not print a repository for `--repository` are treated as
-unassociated. The CLI uses the GitHub App device flow and stores token data under
-`$XDG_CONFIG_HOME/fuzzforge/github.json`, or `$HOME/.config/fuzzforge/github.json`
-when `XDG_CONFIG_HOME` is not set.
+WASM. Modules that do not print metadata or a repository are treated as
+unassociated. The CLI uses the GitHub App device flow and stores token data
+under `$XDG_CONFIG_HOME/fuzzforge/github.json`, or
+`$HOME/.config/fuzzforge/github.json` when `XDG_CONFIG_HOME` is not set.
 
 ## Example WASI Program
 
@@ -123,12 +135,13 @@ The Worker API lives in `worker/src/index.ts` and uses:
 
 Uploads are treated as untrusted input. The Worker verifies that uploaded WASM
 bytes match the requested program hash before storing them. The Worker then runs
-the module with empty stdin and argv `fuzzforge --repository`. If that execution
-prints a repository, the Worker requires an `Authorization: Bearer <token>`
-header, checks `GET /user`, then checks
-`GET /repos/:owner/:repo`, accepting only tokens whose effective repository
-permissions include `push` or `admin`. Empty output or a non-success exit means
-the module is unassociated and the upload remains unauthenticated.
+the module with empty stdin and argv `fuzzforge --metadata`. If that execution
+does not return JSON metadata, the Worker falls back to the legacy
+`fuzzforge --repository` query. If metadata reports a repository, the Worker
+requires an `Authorization: Bearer <token>` header, checks `GET /user`, then
+checks `GET /repos/:owner/:repo`, accepting only tokens whose effective
+repository permissions include `push` or `admin`. Empty output or a non-success
+exit means the module is unassociated and the upload remains unauthenticated.
 
 Proof uploads are verified inside the Worker with a Rust/wasmi verifier compiled
 to WASM: each submitted observation is rerun against the stored WASM, and only
