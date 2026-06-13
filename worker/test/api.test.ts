@@ -502,7 +502,13 @@ describe("fuzzforge worker api", () => {
 
     const payload = parseSseData(text) as {
       timestamp_ms: number;
-      programs: Array<{ program_hash: string; average_fuel_consumed: number }>;
+      programs: Array<{
+        program_hash: string;
+        github_repository: string | null;
+        component_name: string | null;
+        version: string | null;
+        average_fuel_consumed: number;
+      }>;
       buckets: Array<{
         program_hash: string;
         bucket_index: number;
@@ -514,6 +520,9 @@ describe("fuzzforge worker api", () => {
     expect(payload.timestamp_ms).toEqual(expect.any(Number));
     expect(payload.programs).toContainEqual({
       program_hash: PROGRAM_HASH,
+      github_repository: null,
+      component_name: null,
+      version: null,
       average_fuel_consumed: expect.any(Number),
     });
     expect(payload.buckets).toContainEqual({

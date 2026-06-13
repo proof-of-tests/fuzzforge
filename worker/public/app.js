@@ -1,15 +1,20 @@
 const HLL_PRECISION = 6;
 const HLL_BUCKETS = 1 << HLL_PRECISION;
-const RATE_WINDOW_MS = 10_000;
-const SPARKLINE_POINTS = 80;
+const COUNTER_UPDATE_INTERVAL_MS = 1000;
+const COUNTER_ANIMATION_MS = 1000;
 const SEED_BYTES = 32;
 
 const state = {
   metric: "tests",
+  theme: localStorage.getItem("theme") ?? "dark",
   programs: new Map(),
   buckets: new Map(),
-  samples: [],
-  sparkline: [],
+  displayedTotal: 0,
+  pendingDelta: 0,
+  counterTimer: null,
+  counterFrame: null,
+  lastCounterUpdateAt: -COUNTER_UPDATE_INTERVAL_MS,
+  lastProofAt: null,
   submitted: 0,
   runner: {
     active: false,
@@ -22,11 +27,12 @@ const state = {
 const els = {
   connection: document.querySelector(".status"),
   connectionStatus: document.getElementById("connectionStatus"),
+  metricLabel: document.getElementById("metricLabel"),
   totalValue: document.getElementById("totalValue"),
-  rateValue: document.getElementById("rateValue"),
+  counterDelta: document.getElementById("counterDelta"),
+  updateState: document.getElementById("updateState"),
   programCount: document.getElementById("programCount"),
   witnessCount: document.getElementById("witnessCount"),
-  sparkline: document.getElementById("sparkline"),
   runnerState: document.getElementById("runnerState"),
   runnerProgram: document.getElementById("runnerProgram"),
   submittedCount: document.getElementById("submittedCount"),
@@ -35,6 +41,9 @@ const els = {
   stopRunner: document.getElementById("stopRunner"),
   lastUpdate: document.getElementById("lastUpdate"),
   programList: document.getElementById("programList"),
+  settingsOpen: document.getElementById("settingsOpen"),
+  settingsDialog: document.getElementById("settingsDialog"),
+  themeToggle: document.getElementById("themeToggle"),
   segments: document.querySelectorAll(".segment"),
 };
 
@@ -44,16 +53,25 @@ for (const segment of els.segments) {
     for (const item of els.segments) {
       item.classList.toggle("active", item === segment);
     }
-    recordSample(Date.now());
+    resetDisplayedTotal(selectedTotal());
     render();
   });
 }
 
+els.settingsOpen.addEventListener("click", () => {
+  els.settingsDialog.showModal();
+});
+els.themeToggle.addEventListener("change", () => {
+  state.theme = els.themeToggle.checked ? "light" : "dark";
+  localStorage.setItem("theme", state.theme);
+  applyTheme();
+});
 els.startRunner.addEventListener("click", () => {
   void startRunner();
 });
 els.stopRunner.addEventListener("click", stopRunner);
 
+applyTheme();
 connectProofStream();
 render();
 
@@ -73,9 +91,7 @@ function connectProofStream() {
     applyProofEvent(JSON.parse(event.data));
   });
 
-  source.addEventListener("heartbeat", (event) => {
-    const payload = JSON.parse(event.data);
-    recordSample(payload.timestamp_ms);
+  source.addEventListener("heartbeat", () => {
     render();
   });
 
@@ -89,14 +105,18 @@ function applySnapshot(payload) {
   state.buckets.clear();
   applyPrograms(payload.programs);
   applyBuckets(payload.buckets);
-  recordSample(payload.timestamp_ms);
+  resetDisplayedTotal(selectedTotal());
+  state.lastProofAt = state.buckets.size === 0 ? null : (payload.timestamp_ms ?? Date.now());
   render();
 }
 
 function applyProofEvent(payload) {
+  const previousTotal = selectedTotal();
   applyPrograms(payload.programs);
   applyBuckets(payload.buckets);
-  recordSample(payload.timestamp_ms);
+  const nextTotal = selectedTotal();
+  queueCounterDelta(Math.max(0, nextTotal - previousTotal));
+  state.lastProofAt = payload.timestamp_ms ?? Date.now();
   render();
 }
 
@@ -104,6 +124,9 @@ function applyPrograms(programs) {
   for (const program of programs ?? []) {
     state.programs.set(program.program_hash, {
       program_hash: program.program_hash,
+      github_repository: program.github_repository ?? null,
+      component_name: program.component_name ?? null,
+      version: program.version ?? null,
       average_fuel_consumed: Number(program.average_fuel_consumed ?? 0),
     });
   }
@@ -112,23 +135,6 @@ function applyPrograms(programs) {
 function applyBuckets(buckets) {
   for (const bucket of buckets ?? []) {
     state.buckets.set(bucketKey(bucket.program_hash, bucket.bucket_index), bucket);
-  }
-}
-
-function recordSample(timestampMs) {
-  const total = selectedTotal();
-  state.samples.push({ timestampMs, total });
-  while (
-    state.samples.length > 0 &&
-    timestampMs - state.samples[0].timestampMs > RATE_WINDOW_MS
-  ) {
-    state.samples.shift();
-  }
-
-  const rate = currentRate();
-  state.sparkline.push(rate);
-  if (state.sparkline.length > SPARKLINE_POINTS) {
-    state.sparkline.shift();
   }
 }
 
@@ -167,26 +173,15 @@ function totalsByProgram() {
   return totals;
 }
 
-function currentRate() {
-  if (state.samples.length < 2) {
-    return 0;
-  }
-  const first = state.samples[0];
-  const last = state.samples[state.samples.length - 1];
-  const elapsedMs = Math.max(0, last.timestampMs - first.timestampMs);
-  if (elapsedMs === 0) {
-    return 0;
-  }
-  return Math.max(0, last.total - first.total) / (elapsedMs / 1000);
-}
-
 function render() {
-  const total = selectedTotal();
-  const rate = currentRate();
   const totals = totalsByProgram();
 
-  els.totalValue.textContent = formatMetric(total, state.metric);
-  els.rateValue.textContent = `${formatMetric(rate, state.metric)}/sec`;
+  els.metricLabel.textContent = state.metric === "fuel" ? "Instructions" : "Tests";
+  els.totalValue.textContent = formatMetric(state.displayedTotal, state.metric);
+  els.updateState.textContent =
+    state.pendingDelta > 0
+      ? `+${formatMetric(state.pendingDelta, state.metric)} queued`
+      : "Updates on new proofs";
   els.programCount.textContent = `${state.programs.size} programs`;
   els.witnessCount.textContent = `${state.buckets.size} witnesses`;
   els.submittedCount.textContent = String(state.submitted);
@@ -196,12 +191,92 @@ function render() {
   els.startRunner.disabled = state.runner.active;
   els.stopRunner.disabled = !state.runner.active;
   els.lastUpdate.textContent =
-    state.samples.length === 0
+    state.lastProofAt === null
       ? "No events yet"
-      : new Date(state.samples[state.samples.length - 1].timestampMs).toLocaleTimeString();
+      : new Date(state.lastProofAt).toLocaleTimeString();
 
   renderProgramList(totals);
-  renderSparkline();
+}
+
+function queueCounterDelta(delta) {
+  if (delta <= 0) {
+    return;
+  }
+  state.pendingDelta += delta;
+
+  if (state.counterTimer !== null) {
+    return;
+  }
+
+  const now = performance.now();
+  const elapsed = now - state.lastCounterUpdateAt;
+  const delay = Math.max(0, COUNTER_UPDATE_INTERVAL_MS - elapsed);
+  state.counterTimer = window.setTimeout(flushCounterDelta, delay);
+}
+
+function flushCounterDelta() {
+  state.counterTimer = null;
+  if (state.pendingDelta <= 0) {
+    return;
+  }
+
+  const delta = state.pendingDelta;
+  state.pendingDelta = 0;
+  state.lastCounterUpdateAt = performance.now();
+  animateCounter(state.displayedTotal, state.displayedTotal + delta);
+  flashCounterDelta(delta);
+  render();
+}
+
+function animateCounter(from, to) {
+  if (state.counterFrame !== null) {
+    cancelAnimationFrame(state.counterFrame);
+  }
+
+  const startedAt = performance.now();
+  const step = (now) => {
+    const elapsed = Math.min(1, (now - startedAt) / COUNTER_ANIMATION_MS);
+    state.displayedTotal = from + (to - from) * sigmoidProgress(elapsed);
+    els.totalValue.textContent = formatMetric(state.displayedTotal, state.metric);
+
+    if (elapsed < 1) {
+      state.counterFrame = requestAnimationFrame(step);
+    } else {
+      state.counterFrame = null;
+      state.displayedTotal = to;
+      render();
+    }
+  };
+
+  state.counterFrame = requestAnimationFrame(step);
+}
+
+function resetDisplayedTotal(total) {
+  if (state.counterTimer !== null) {
+    clearTimeout(state.counterTimer);
+    state.counterTimer = null;
+  }
+  if (state.counterFrame !== null) {
+    cancelAnimationFrame(state.counterFrame);
+    state.counterFrame = null;
+  }
+  state.pendingDelta = 0;
+  state.displayedTotal = total;
+}
+
+function sigmoidProgress(progress) {
+  const slope = 12;
+  const min = 1 / (1 + Math.exp(slope / 2));
+  const max = 1 / (1 + Math.exp(-slope / 2));
+  const value = 1 / (1 + Math.exp(-slope * (progress - 0.5)));
+  return (value - min) / (max - min);
+}
+
+function flashCounterDelta(delta) {
+  els.counterDelta.textContent = `+${formatMetric(delta, state.metric)}`;
+  els.counterDelta.classList.remove("flash");
+  void els.counterDelta.offsetWidth;
+  els.counterDelta.classList.add("flash");
 }
 
 function renderProgramList(totals) {
@@ -214,54 +289,29 @@ function renderProgramList(totals) {
     .sort((left, right) => right[1] - left[1])
     .slice(0, 12)
     .map(([programHash, tests]) => {
-      const averageFuel = state.programs.get(programHash)?.average_fuel_consumed ?? 0;
+      const program = state.programs.get(programHash);
+      const averageFuel = program?.average_fuel_consumed ?? 0;
+      const repository = program?.github_repository ?? "Unassociated";
+      const component = program?.component_name ?? "Unknown component";
+      const version = program?.version ?? "No version";
       return `
         <div class="program-row">
-          <div class="hash" title="${programHash}">${programHash}</div>
+          <div class="program-main">
+            <div class="program-title">
+              <span title="${escapeHtml(repository)}">${escapeHtml(repository)}</span>
+              <span class="program-version">${escapeHtml(version)}</span>
+            </div>
+            <div class="program-meta">
+              <span>${escapeHtml(component)}</span>
+              <span class="hash" title="${programHash}">${programHash}</span>
+            </div>
+          </div>
           <div class="program-stat">${formatMetric(tests, "tests")} tests</div>
-          <div class="program-stat">${formatMetric(tests * averageFuel, "fuel")} fuel</div>
+          <div class="program-stat">${formatMetric(tests * averageFuel, "fuel")} instructions</div>
         </div>
       `;
     });
   els.programList.innerHTML = rows.join("");
-}
-
-function renderSparkline() {
-  const canvas = els.sparkline;
-  const ctx = canvas.getContext("2d");
-  const width = canvas.width;
-  const height = canvas.height;
-  ctx.clearRect(0, 0, width, height);
-
-  ctx.strokeStyle = "rgba(167, 173, 159, 0.18)";
-  ctx.lineWidth = 1;
-  for (let line = 1; line < 4; line += 1) {
-    const y = Math.round((height / 4) * line);
-    ctx.beginPath();
-    ctx.moveTo(0, y);
-    ctx.lineTo(width, y);
-    ctx.stroke();
-  }
-
-  const points = state.sparkline;
-  if (points.length < 2) {
-    return;
-  }
-
-  const max = Math.max(...points, 1);
-  ctx.strokeStyle = state.metric === "fuel" ? "#f2bd67" : "#7fd77e";
-  ctx.lineWidth = 3;
-  ctx.beginPath();
-  points.forEach((point, index) => {
-    const x = (index / (SPARKLINE_POINTS - 1)) * width;
-    const y = height - (point / max) * (height - 16) - 8;
-    if (index === 0) {
-      ctx.moveTo(x, y);
-    } else {
-      ctx.lineTo(x, y);
-    }
-  });
-  ctx.stroke();
 }
 
 async function startRunner() {
@@ -448,7 +498,7 @@ function bucketKey(programHash, bucketIndex) {
 }
 
 function formatMetric(value, metric) {
-  if (!Number.isFinite(value)) {
+  if (!Number.isFinite(value) || value === 0) {
     return "0";
   }
   if (metric === "fuel" && value >= 1_000_000_000) {
@@ -464,6 +514,20 @@ function formatMetric(value, metric) {
     return value.toFixed(0);
   }
   return value.toFixed(2);
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function applyTheme() {
+  document.documentElement.dataset.theme = state.theme;
+  els.themeToggle.checked = state.theme === "light";
 }
 
 function setConnection(status, label) {

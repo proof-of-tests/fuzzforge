@@ -14,27 +14,31 @@
           <p class="eyebrow">FuzzForge</p>
           <h1>Live proof counter</h1>
         </div>
-        <div class="status" data-status="connecting">
-          <span class="status-dot" aria-hidden="true"></span>
-          <span id="connectionStatus">Connecting</span>
+        <div class="topbar-actions">
+          <button id="settingsOpen" class="icon-command" type="button" aria-label="Open settings">
+            Settings
+          </button>
+          <div class="status" data-status="connecting">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span id="connectionStatus">Connecting</span>
+          </div>
         </div>
       </header>
 
       <section class="metrics" aria-label="Live metrics">
         <div class="metric-primary">
           <div class="metric-head">
-            <div class="segmented" role="group" aria-label="Metric">
-              <button class="segment active" type="button" data-metric="tests">Tests</button>
-              <button class="segment" type="button" data-metric="fuel">Instructions</button>
-            </div>
+            <span id="metricLabel" class="eyebrow">Tests</span>
             <span id="programCount" class="muted">0 programs</span>
           </div>
-          <div id="totalValue" class="total">0</div>
-          <div class="rate-row">
-            <span id="rateValue">0/sec</span>
+          <div class="total-wrap">
+            <div id="totalValue" class="total">0</div>
+            <span id="counterDelta" class="counter-delta" aria-hidden="true"></span>
+          </div>
+          <div class="proof-row">
+            <span id="updateState" class="muted">Waiting for proofs</span>
             <span id="witnessCount" class="muted">0 witnesses</span>
           </div>
-          <canvas id="sparkline" width="720" height="120" aria-label="Rate sparkline"></canvas>
         </div>
 
         <div class="runner">
@@ -71,5 +75,30 @@
         <div id="programList" class="program-list"></div>
       </section>
     </main>
+
+    <dialog id="settingsDialog" class="settings-dialog" aria-labelledby="settingsTitle">
+      <form method="dialog">
+        <div class="settings-head">
+          <h2 id="settingsTitle">Settings</h2>
+          <button class="close-command" type="submit" aria-label="Close settings">Close</button>
+        </div>
+
+        <fieldset>
+          <legend>Counter</legend>
+          <div class="segmented" role="group" aria-label="Metric">
+            <button class="segment active" type="button" data-metric="tests">Tests</button>
+            <button class="segment" type="button" data-metric="fuel">Instructions</button>
+          </div>
+        </fieldset>
+
+        <label class="toggle-row">
+          <span>
+            <strong>Light mode</strong>
+            <small>Use a brighter dashboard palette.</small>
+          </span>
+          <input id="themeToggle" type="checkbox" />
+        </label>
+      </form>
+    </dialog>
   </body>
 </html>

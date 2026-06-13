@@ -50,6 +50,9 @@ interface ProgramListResponse {
 
 interface ProofStreamProgram {
   program_hash: string;
+  github_repository: string | null;
+  component_name: string | null;
+  version: string | null;
   average_fuel_consumed: number | null;
 }
 
@@ -636,7 +639,12 @@ function streamProofs(request: Request, url: URL, env: Env): Response {
 async function loadProofStreamSnapshot(env: Env): Promise<ProofStreamSnapshot> {
   const [programs, buckets] = await Promise.all([
     env.DB.prepare(
-      `SELECT program_hash, average_fuel_consumed
+      `SELECT
+        program_hash,
+        github_repository,
+        component_name,
+        version,
+        average_fuel_consumed
        FROM programs
        ORDER BY program_hash ASC`,
     ).all<ProofStreamProgram>(),
