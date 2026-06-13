@@ -96,8 +96,8 @@ type VerifierExports = {
   ff_verify(
     wasmPtr: number,
     wasmLen: number,
-    recordPtr: number,
-    recordLen: number,
+    observationPtr: number,
+    observationLen: number,
     outPtr: number,
     outLen: number,
   ): number;
@@ -364,47 +364,41 @@ async function listPrograms(url: URL, env: Env): Promise<Response> {
 }
 
 async function putProof(request: Request, env: Env, programHash: string): Promise<Response> {
-  const record = validateHllRecord(await request.json(), programHash);
+  const observation = validateProofObservation(await request.json());
   const wasmObject = await env.WASM_BUCKET.get(wasmKey(programHash));
   if (wasmObject === null) {
     throw new HttpError(404, "wasm_not_found");
   }
   const wasm = await wasmObject.arrayBuffer();
-  const verification = await verifyProof(wasm, record);
+  const verification = await verifyProof(wasm, observation);
 
   const statements: D1PreparedStatement[] = [
     fuelEstimateUpdateStatement(env, programHash, verification),
   ];
-
-  for (const observation of record.buckets) {
-    if (observation === null) {
-      continue;
-    }
-    const bucket = observationBucket(observation.observation_hash);
-    statements.push(
-      env.DB.prepare(
-        `INSERT INTO hll_buckets (
-          program_hash,
-          bucket_index,
-          verifier_version,
-          observation_hash,
-          seed_hex
-        )
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(program_hash, bucket_index) DO UPDATE SET
-          verifier_version = excluded.verifier_version,
-          observation_hash = excluded.observation_hash,
-          seed_hex = excluded.seed_hex
-         WHERE excluded.observation_hash < hll_buckets.observation_hash`,
-      ).bind(
-        programHash,
-        bucket.index,
-        CURRENT_VERIFIER_VERSION,
-        observation.observation_hash,
-        observation.seed_hex,
-      ),
-    );
-  }
+  const bucket = observationBucket(observation.observation_hash);
+  statements.push(
+    env.DB.prepare(
+      `INSERT INTO hll_buckets (
+        program_hash,
+        bucket_index,
+        verifier_version,
+        observation_hash,
+        seed_hex
+      )
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(program_hash, bucket_index) DO UPDATE SET
+        verifier_version = excluded.verifier_version,
+        observation_hash = excluded.observation_hash,
+        seed_hex = excluded.seed_hex
+       WHERE excluded.observation_hash < hll_buckets.observation_hash`,
+    ).bind(
+      programHash,
+      bucket.index,
+      CURRENT_VERIFIER_VERSION,
+      observation.observation_hash,
+      observation.seed_hex,
+    ),
+  );
 
   await env.DB.batch(statements);
   const proof = await loadProof(env, programHash);
@@ -512,47 +506,24 @@ function streamHashResults(request: Request, url: URL, env: Env): Response {
   );
 }
 
-function validateHllRecord(value: unknown, programHash: string): HllRecord {
+function validateProofObservation(value: unknown): StoredObservation {
   if (!isRecord(value)) {
-    throw new HttpError(400, "invalid_proof");
+    throw new HttpError(400, "invalid_observation");
   }
-  const record = value as Partial<HllRecord>;
-  if (record.program_hash !== programHash) {
-    throw new HttpError(400, "program_hash_mismatch");
+  if (
+    typeof value.seed_hex !== "string" ||
+    typeof value.observation_hash !== "string" ||
+    !SEED_RE.test(value.seed_hex) ||
+    !HASH_RE.test(value.observation_hash) ||
+    value.verifier_version !== CURRENT_VERIFIER_VERSION
+  ) {
+    throw new HttpError(400, "invalid_observation");
   }
-  if (record.schema_version !== 2 || record.precision !== HLL_PRECISION) {
-    throw new HttpError(400, "unsupported_hll_schema");
-  }
-  if (!Array.isArray(record.buckets) || record.buckets.length !== HLL_BUCKETS) {
-    throw new HttpError(400, "invalid_hll_buckets");
-  }
-  let observations = 0;
-  for (let index = 0; index < record.buckets.length; index += 1) {
-    const observation = record.buckets[index];
-    if (observation === null) {
-      continue;
-    }
-    observations += 1;
-    if (!isRecord(observation)) {
-      throw new HttpError(400, "invalid_hll_bucket");
-    }
-    if (
-      typeof observation.seed_hex !== "string" ||
-      typeof observation.observation_hash !== "string" ||
-      !SEED_RE.test(observation.seed_hex) ||
-      !HASH_RE.test(observation.observation_hash) ||
-      observation.verifier_version !== CURRENT_VERIFIER_VERSION
-    ) {
-      throw new HttpError(400, "invalid_hll_bucket");
-    }
-    if (observationBucket(observation.observation_hash).index !== index) {
-      throw new HttpError(400, "invalid_hll_bucket");
-    }
-  }
-  if (observations !== 1) {
-    throw new HttpError(400, "invalid_hll_buckets");
-  }
-  return record as HllRecord;
+  return {
+    seed_hex: value.seed_hex,
+    verifier_version: CURRENT_VERIFIER_VERSION,
+    observation_hash: value.observation_hash,
+  };
 }
 
 async function verifyGitHubRepositoryAccess(
@@ -749,21 +720,21 @@ async function hashWasm(wasm: ArrayBuffer): Promise<string> {
 
 async function verifyProof(
   wasm: ArrayBuffer,
-  record: HllRecord,
+  observation: StoredObservation,
 ): Promise<ProofVerificationReport> {
   const exports = await verifierExports();
   const wasmBytes = new Uint8Array(wasm);
-  const recordBytes = new TextEncoder().encode(JSON.stringify(record));
+  const observationBytes = new TextEncoder().encode(JSON.stringify(observation));
   const wasmPtr = copyIntoVerifier(exports, wasmBytes);
-  const recordPtr = copyIntoVerifier(exports, recordBytes);
+  const observationPtr = copyIntoVerifier(exports, observationBytes);
   const outLen = 8;
   const outPtr = exports.ff_alloc(outLen);
   try {
     const code = exports.ff_verify(
       wasmPtr,
       wasmBytes.byteLength,
-      recordPtr,
-      recordBytes.byteLength,
+      observationPtr,
+      observationBytes.byteLength,
       outPtr,
       outLen,
     );
@@ -780,7 +751,7 @@ async function verifyProof(
     };
   } finally {
     exports.ff_dealloc(wasmPtr, wasmBytes.byteLength);
-    exports.ff_dealloc(recordPtr, recordBytes.byteLength);
+    exports.ff_dealloc(observationPtr, observationBytes.byteLength);
     exports.ff_dealloc(outPtr, outLen);
   }
 }

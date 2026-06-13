@@ -6,8 +6,6 @@ use wasmi::{
     StoreLimitsBuilder,
 };
 
-const HLL_PRECISION: u8 = 6;
-const HLL_BUCKETS: usize = 1 << HLL_PRECISION;
 const SUPPORTED_VERIFIER_VERSIONS: [u32; 1] = [1];
 const DEFAULT_FUEL: u64 = 10_000_000;
 const DEFAULT_MEMORY_BYTES: usize = 64 * 1024 * 1024;
@@ -29,7 +27,6 @@ const DEFAULT_TABLE_ELEMENTS: usize = 10_000;
 const VERIFY_OK: i32 = 0;
 const VERIFY_INVALID_INPUT: i32 = 1;
 const VERIFY_INVALID_RECORD: i32 = 2;
-const VERIFY_WASM_MISMATCH: i32 = 3;
 const VERIFY_OBSERVATION_MISMATCH: i32 = 4;
 const VERIFY_UNSUPPORTED_WASM: i32 = 5;
 const VERIFY_HASH_MISMATCH: i32 = 9;
@@ -56,14 +53,6 @@ impl fmt::Display for RunStatus {
             Self::Trap(message) => write!(f, "trap:{message}"),
         }
     }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct HllRecord {
-    pub schema_version: u32,
-    pub program_hash: String,
-    pub precision: u8,
-    pub buckets: Vec<Option<StoredObservation>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,18 +177,18 @@ pub unsafe extern "C" fn ff_estimate_fuel(
 pub unsafe extern "C" fn ff_verify(
     wasm_ptr: *const u8,
     wasm_len: usize,
-    record_ptr: *const u8,
-    record_len: usize,
+    observation_ptr: *const u8,
+    observation_len: usize,
     out_ptr: *mut u8,
     out_len: usize,
 ) -> i32 {
-    if wasm_ptr.is_null() || record_ptr.is_null() || out_ptr.is_null() || out_len < 8 {
+    if wasm_ptr.is_null() || observation_ptr.is_null() || out_ptr.is_null() || out_len < 8 {
         return VERIFY_INVALID_INPUT;
     }
     let wasm = unsafe { slice::from_raw_parts(wasm_ptr, wasm_len) };
-    let record_json = unsafe { slice::from_raw_parts(record_ptr, record_len) };
+    let observation_json = unsafe { slice::from_raw_parts(observation_ptr, observation_len) };
     let out = unsafe { slice::from_raw_parts_mut(out_ptr, out_len) };
-    match verify(wasm, record_json) {
+    match verify(wasm, observation_json) {
         Ok(fuel_consumed) => {
             out[..8].copy_from_slice(&fuel_consumed.to_le_bytes());
             VERIFY_OK
@@ -219,36 +208,11 @@ fn estimate_fuel(wasm: &[u8]) -> Result<u64, i32> {
     Ok(output.fuel_consumed)
 }
 
-fn verify(wasm: &[u8], record_json: &[u8]) -> Result<u64, i32> {
-    let record: HllRecord =
-        serde_json::from_slice(record_json).map_err(|_| VERIFY_INVALID_RECORD)?;
-    if record.schema_version != 2
-        || record.precision != HLL_PRECISION
-        || record.buckets.len() != HLL_BUCKETS
-        || record.buckets.iter().all(Option::is_none)
-    {
-        return Err(VERIFY_INVALID_RECORD);
-    }
-
+fn verify(wasm: &[u8], observation_json: &[u8]) -> Result<u64, i32> {
+    let observation: StoredObservation =
+        serde_json::from_slice(observation_json).map_err(|_| VERIFY_INVALID_RECORD)?;
     let program = WasmProgram::compile(wasm).map_err(|_| VERIFY_UNSUPPORTED_WASM)?;
-    if record.program_hash != program.program_hash {
-        return Err(VERIFY_WASM_MISMATCH);
-    }
-
-    let mut verified_fuel = None;
-    for (bucket, expected) in record.buckets.iter().enumerate() {
-        let Some(expected) = expected else {
-            continue;
-        };
-        if verified_fuel.is_some() {
-            return Err(VERIFY_INVALID_RECORD);
-        }
-        if observation_bucket(&expected.observation_hash)? != bucket {
-            return Err(VERIFY_INVALID_RECORD);
-        }
-        verified_fuel = Some(verify_observation(&program, &record.program_hash, expected)?);
-    }
-    verified_fuel.ok_or(VERIFY_INVALID_RECORD)
+    verify_observation(&program, &program.program_hash, &observation)
 }
 
 fn query_metadata(wasm: &[u8]) -> Result<Option<String>, i32> {
@@ -702,18 +666,6 @@ fn seed_from_hex(seed_hex: &str) -> Option<Vec<u8>> {
         bytes.push((high << 4) | low);
     }
     Some(bytes)
-}
-
-fn observation_bucket(observation_hash: &str) -> Result<usize, i32> {
-    if observation_hash.len() != 64 {
-        return Err(VERIFY_INVALID_RECORD);
-    }
-    let mut value = 0u64;
-    for (shift, byte) in observation_hash.as_bytes().iter().take(16).enumerate() {
-        let digit = hex_digit(*byte).ok_or(VERIFY_INVALID_RECORD)?;
-        value |= u64::from(digit) << ((15 - shift) * 4);
-    }
-    Ok((value >> (u64::BITS - u32::from(HLL_PRECISION))) as usize)
 }
 
 fn hex_digit(byte: u8) -> Option<u8> {
