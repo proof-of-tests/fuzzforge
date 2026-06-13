@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs,
     io::{self, IsTerminal, Write},
     path::PathBuf,
@@ -14,9 +15,9 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use fuzzforge::{
-    DEFAULT_FUEL, DEFAULT_MEMORY_BYTES, DEFAULT_SAVE_FUEL_INTERVAL, DEFAULT_SEED_BYTES, HllRecord,
-    RunConfig, RunSession, Sketch, Store, generate_seed, hash_bytes_hex, hash_wasm_file,
-    query_wasm_metadata, seed_from_hex, verify_wasm,
+    DEFAULT_FUEL, DEFAULT_MEMORY_BYTES, DEFAULT_SAVE_FUEL_INTERVAL, DEFAULT_SEED_BYTES,
+    HLL_PRECISION, HllRecord, RunConfig, RunSession, Sketch, Store, generate_seed, hash_bytes_hex,
+    hash_wasm_file, query_wasm_metadata, seed_from_hex, verify_wasm,
 };
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -509,7 +510,10 @@ fn run_corpus_program(
     download: &CorpusDownload,
     fuel_budget: u64,
 ) -> Result<()> {
-    let initial_record = fetch_central_record(client, api_url, &download.program.program_hash)?;
+    let CentralState {
+        record: initial_record,
+        mut bucket_witnesses,
+    } = fetch_central_state(client, api_url, &download.program.program_hash)?;
     let mut session = RunSession::from_wasm_bytes_with_record(
         &download.wasm,
         initial_record,
@@ -530,7 +534,25 @@ fn run_corpus_program(
             .with_context(|| format!("failed to run {}", download.program.program_hash))?;
         fuel_spent = fuel_spent.saturating_add(result.fuel_consumed);
         let proof = single_observation_record(session.record())?;
-        submit_proof_record(client, api_url, &proof)?;
+        let observation_hash = &proof.observations[0].observation_hash;
+        let bucket = observation_bucket(observation_hash)?;
+        if bucket_witnesses
+            .get(&bucket)
+            .is_some_and(|previous| observation_hash >= previous)
+        {
+            eprintln!(
+                "skipped_observation={} bucket={} previous_observation_hash={}",
+                proof.program_hash,
+                bucket,
+                bucket_witnesses
+                    .get(&bucket)
+                    .map(String::as_str)
+                    .unwrap_or("-")
+            );
+        } else {
+            submit_proof_record(client, api_url, &proof)?;
+            bucket_witnesses.insert(bucket, observation_hash.clone());
+        }
         if result.fuel_consumed == 0 {
             eprintln!("program_zero_fuel={}", session.program_hash());
             break;
@@ -545,7 +567,7 @@ fn run_corpus_program(
     Ok(())
 }
 
-fn fetch_central_record(client: &Client, api_url: &str, program_hash: &str) -> Result<HllRecord> {
+fn fetch_central_state(client: &Client, api_url: &str, program_hash: &str) -> Result<CentralState> {
     let proof_url = format!(
         "{}/api/programs/{program_hash}/proof",
         api_url.trim_end_matches('/')
@@ -555,7 +577,10 @@ fn fetch_central_record(client: &Client, api_url: &str, program_hash: &str) -> R
         .send()
         .with_context(|| format!("failed to fetch central proof from {proof_url}"))?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(HllRecord::new(program_hash.to_owned()));
+        return Ok(CentralState {
+            record: HllRecord::new(program_hash.to_owned()),
+            bucket_witnesses: HashMap::new(),
+        });
     }
     ensure_success_ref(&response, "central proof fetch")?;
     let proof: CentralProof = response.json().context("failed to parse central proof")?;
@@ -572,6 +597,16 @@ fn fetch_central_record(client: &Client, api_url: &str, program_hash: &str) -> R
     if proof.precision != 6 {
         anyhow::bail!("unsupported central proof precision {}", proof.precision);
     }
+    let mut bucket_witnesses = HashMap::new();
+    for observation in &proof.observations {
+        let bucket = observation_bucket(&observation.observation_hash)?;
+        match bucket_witnesses.get(&bucket) {
+            Some(previous) if previous <= &observation.observation_hash => {}
+            _ => {
+                bucket_witnesses.insert(bucket, observation.observation_hash.clone());
+            }
+        }
+    }
     let record = HllRecord {
         schema_version: proof.schema_version,
         program_hash: proof.program_hash,
@@ -585,7 +620,10 @@ fn fetch_central_record(client: &Client, api_url: &str, program_hash: &str) -> R
         observations: Vec::new(),
     };
     record.validate()?;
-    Ok(record)
+    Ok(CentralState {
+        record,
+        bucket_witnesses,
+    })
 }
 
 fn single_observation_record(record: &HllRecord) -> Result<HllRecord> {
@@ -619,6 +657,19 @@ fn submit_proof_record(client: &Client, api_url: &str, record: &HllRecord) -> Re
         record.observations.len()
     );
     Ok(())
+}
+
+fn observation_bucket(observation_hash: &str) -> Result<usize> {
+    if observation_hash.len() < 16
+        || !observation_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        anyhow::bail!("invalid observation hash `{observation_hash}`");
+    }
+    let value = u64::from_str_radix(&observation_hash[..16], 16)
+        .with_context(|| format!("failed to parse observation hash `{observation_hash}`"))?;
+    Ok((value >> (u64::BITS - u32::from(HLL_PRECISION))) as usize)
 }
 
 fn api_url_or_env(api_url: Option<String>) -> Result<String> {
@@ -895,6 +946,11 @@ struct ProgramListResponse {
 struct ProgramSummary {
     program_hash: String,
     github_repository: Option<String>,
+}
+
+struct CentralState {
+    record: HllRecord,
+    bucket_witnesses: HashMap<usize, String>,
 }
 
 #[derive(Debug, Deserialize)]

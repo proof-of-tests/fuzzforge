@@ -660,6 +660,76 @@ fn corpus_downloads_associated_programs_runs_and_submits() {
     );
 }
 
+#[test]
+fn corpus_skips_observations_that_do_not_improve_central_proof() {
+    let _guard = HTTP_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let temp = tempdir().expect("tempdir");
+    let cache_path = temp.path().join("cache");
+    let wasm = associated_echo_wasm();
+    let expected_hash = blake3::hash(&wasm).to_hex().to_string();
+
+    let (server, api_url) = test_server();
+    let (tx, rx) = mpsc::channel();
+    let server_thread = thread::spawn({
+        let expected_hash = expected_hash.clone();
+        let wasm = wasm.clone();
+        move || {
+            for request_index in 0..4 {
+                let mut request = server.recv().expect("request");
+                let mut body = Vec::new();
+                std::io::Read::read_to_end(request.as_reader(), &mut body).expect("body");
+                let method = request.method().as_str().to_owned();
+                let url = request.url().to_owned();
+                tx.send((method.clone(), url.clone(), body))
+                    .expect("send request");
+
+                let response = match (request_index, method.as_str(), url.as_str()) {
+                    (0, "GET", "/api/programs?associated=true&limit=100") => {
+                        tiny_http::Response::from_string(format!(
+                            r#"{{"programs":[{{"program_hash":"{expected_hash}","github_repository":"owner/repo"}}],"next_cursor":null}}"#
+                        ))
+                        .with_header(json_header())
+                    }
+                    (1, "GET", path) if path == format!("/api/programs/{expected_hash}/wasm") => {
+                        tiny_http::Response::from_data(wasm.clone()).with_header(wasm_header())
+                    }
+                    (2, "GET", path) if path == format!("/api/programs/{expected_hash}/proof") => {
+                        tiny_http::Response::from_string(central_minimum_proof(&expected_hash))
+                            .with_header(json_header())
+                    }
+                    (_, "GET", "/api/programs?associated=true&limit=100") => {
+                        tiny_http::Response::from_string(
+                            r#"{"programs":[],"next_cursor":null}"#,
+                        )
+                        .with_header(json_header())
+                    }
+                    _ => tiny_http::Response::from_string("{}").with_header(json_header()),
+                };
+                request.respond(response).expect("respond");
+            }
+        }
+    });
+
+    let mut corpus = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
+        .env("XDG_CACHE_HOME", &cache_path)
+        .args(["corpus", "--api-url", &api_url, "--fuel-budget=1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("corpus command");
+
+    let requests: Vec<_> = (0..4).map(|_| rx.recv().expect("request")).collect();
+    server_thread.join().expect("server thread");
+    thread::sleep(Duration::from_millis(50));
+    let _ = corpus.kill();
+    let output = corpus.wait_with_output().expect("corpus output");
+    assert!(!stdout(&output).contains("submitted_observation="));
+    assert!(stderr(&output).contains("skipped_observation="));
+    assert!(requests.iter().all(|request| request.0 != "POST"));
+}
+
 fn test_server() -> (tiny_http::Server, String) {
     for _ in 0..100 {
         let port = NEXT_TEST_PORT.fetch_add(1, Ordering::Relaxed);
@@ -668,6 +738,34 @@ fn test_server() -> (tiny_http::Server, String) {
         }
     }
     panic!("failed to bind test HTTP server")
+}
+
+fn central_minimum_proof(program_hash: &str) -> String {
+    let observations = (0u64..64)
+        .map(|bucket| {
+            let prefix = bucket << (64 - 6);
+            format!(
+                r#"{{"seed_hex":"{:02x}","verifier_version":1,"observation_hash":"{prefix:016x}{}"}}"#,
+                bucket,
+                "0".repeat(48)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"{{"schema_version":2,"program_hash":"{program_hash}","precision":6,"sketch":{{"registers":[{}]}},"observations":[{observations}]}}"#,
+        vec!["1"; 64].join(",")
+    )
+}
+
+fn json_header() -> tiny_http::Header {
+    tiny_http::Header::from_bytes(b"content-type".as_slice(), b"application/json".as_slice())
+        .unwrap()
+}
+
+fn wasm_header() -> tiny_http::Header {
+    tiny_http::Header::from_bytes(b"content-type".as_slice(), b"application/wasm".as_slice())
+        .unwrap()
 }
 
 fn stdout(output: &std::process::Output) -> String {
