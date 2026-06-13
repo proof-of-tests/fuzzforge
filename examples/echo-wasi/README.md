@@ -21,3 +21,8 @@ cargo run -- verify \
 
 The explicit seed above is the UTF-8 bytes for `hello fuzzforge`; the expected
 guest stdout is the exact seed bytes.
+
+When run with `--repository`, the program prints `proof-of-tests/fuzzforge`
+instead of echoing stdin. Uploading the compiled WASM to a FuzzForge API
+therefore requires `fuzzforge auth login` for a GitHub user with write or admin
+access to that repository.

@@ -39,10 +39,6 @@ interface ProgramRow {
   updated_at: string;
 }
 
-interface WasmMetadata {
-  github_repository: string | null;
-}
-
 interface GitHubUser {
   login?: unknown;
 }
@@ -53,8 +49,6 @@ interface GitHubPermission {
 
 const HASH_RE = /^[0-9a-f]{64}$/;
 const GITHUB_REPO_RE = /^[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?\/[a-z0-9._-]{1,100}$/;
-const WASM_METADATA_SECTION = "fuzzforge.metadata";
-const MAX_WASM_METADATA_BYTES = 4096;
 const HLL_PRECISION = 6;
 const HLL_BUCKETS = 1 << HLL_PRECISION;
 const MAX_STREAM_INTERVAL_MS = 10_000;
@@ -73,6 +67,7 @@ type VerifierExports = {
   ff_alloc(len: number): number;
   ff_dealloc(ptr: number, len: number): void;
   ff_hash_hex(wasmPtr: number, wasmLen: number, outPtr: number, outLen: number): number;
+  ff_repository(wasmPtr: number, wasmLen: number, outPtr: number, outLen: number): number;
   ff_verify(wasmPtr: number, wasmLen: number, recordPtr: number, recordLen: number): number;
 };
 
@@ -162,18 +157,18 @@ async function putWasm(request: Request, env: Env, programHash: string): Promise
   if (actualHash !== programHash) {
     throw new HttpError(400, "wasm_hash_mismatch");
   }
-  const metadata = parseWasmMetadata(new Uint8Array(bytes));
+  const githubRepository = await queryWasmRepository(bytes);
   const githubVerifiedBy =
-    metadata.github_repository === null
+    githubRepository === null
       ? null
-      : await verifyGitHubRepositoryAccess(request, env, metadata.github_repository);
+      : await verifyGitHubRepositoryAccess(request, env, githubRepository);
 
   await env.WASM_BUCKET.put(wasmKey(programHash), bytes, {
     httpMetadata: { contentType: "application/wasm" },
     customMetadata:
-      metadata.github_repository === null
+      githubRepository === null
         ? { programHash }
-        : { programHash, githubRepository: metadata.github_repository },
+        : { programHash, githubRepository },
   });
 
   const now = new Date().toISOString();
@@ -197,9 +192,9 @@ async function putWasm(request: Request, env: Env, programHash: string): Promise
   )
     .bind(
       programHash,
-      metadata.github_repository,
+      githubRepository,
       githubVerifiedBy,
-      metadata.github_repository === null ? null : now,
+      githubRepository === null ? null : now,
       bytes.byteLength,
       now,
       now,
@@ -209,7 +204,7 @@ async function putWasm(request: Request, env: Env, programHash: string): Promise
   return json({
     program_hash: programHash,
     bytes: bytes.byteLength,
-    github_repository: metadata.github_repository,
+    github_repository: githubRepository,
     github_verified_by: githubVerifiedBy,
   });
 }
@@ -411,64 +406,6 @@ function validateHllRecord(value: unknown, programHash: string): HllRecord {
   return record as HllRecord;
 }
 
-function parseWasmMetadata(wasm: Uint8Array): WasmMetadata {
-  if (
-    wasm.byteLength < 8 ||
-    wasm[0] !== 0x00 ||
-    wasm[1] !== 0x61 ||
-    wasm[2] !== 0x73 ||
-    wasm[3] !== 0x6d ||
-    wasm[4] !== 0x01 ||
-    wasm[5] !== 0x00 ||
-    wasm[6] !== 0x00 ||
-    wasm[7] !== 0x00
-  ) {
-    throw new HttpError(400, "invalid_wasm_metadata");
-  }
-
-  let offset = 8;
-  let githubRepository: string | null = null;
-  while (offset < wasm.byteLength) {
-    const sectionId = readByte(wasm, offset);
-    offset = sectionId.offset;
-    const sectionLen = readLebU32(wasm, offset);
-    offset = sectionLen.offset;
-    const sectionEnd = offset + sectionLen.value;
-    if (sectionEnd > wasm.byteLength) {
-      throw new HttpError(400, "invalid_wasm_metadata");
-    }
-
-    if (sectionId.value === 0) {
-      let customOffset = offset;
-      const nameLen = readLebU32(wasm, customOffset);
-      customOffset = nameLen.offset;
-      const nameEnd = customOffset + nameLen.value;
-      if (nameEnd > sectionEnd) {
-        throw new HttpError(400, "invalid_wasm_metadata");
-      }
-      const name = decodeUtf8(wasm.subarray(customOffset, nameEnd));
-      if (name === WASM_METADATA_SECTION) {
-        if (githubRepository !== null) {
-          throw new HttpError(400, "invalid_wasm_metadata");
-        }
-        const metadataBytes = wasm.subarray(nameEnd, sectionEnd);
-        if (metadataBytes.byteLength > MAX_WASM_METADATA_BYTES) {
-          throw new HttpError(400, "invalid_wasm_metadata");
-        }
-        const metadata = parseJsonObject(decodeUtf8(metadataBytes));
-        if (typeof metadata.github_repository !== "string") {
-          throw new HttpError(400, "invalid_wasm_metadata");
-        }
-        githubRepository = normalizeGitHubRepository(metadata.github_repository);
-      }
-    }
-
-    offset = sectionEnd;
-  }
-
-  return { github_repository: githubRepository };
-}
-
 async function verifyGitHubRepositoryAccess(
   request: Request,
   env: Env,
@@ -516,6 +453,29 @@ async function verifyGitHubRepositoryAccess(
   return user.login;
 }
 
+async function queryWasmRepository(wasm: ArrayBuffer): Promise<string | null> {
+  const exports = await verifierExports();
+  const wasmBytes = new Uint8Array(wasm);
+  const wasmPtr = copyIntoVerifier(exports, wasmBytes);
+  const outPtr = exports.ff_alloc(256);
+  try {
+    const len = exports.ff_repository(wasmPtr, wasmBytes.byteLength, outPtr, 256);
+    if (len < 0) {
+      throw new HttpError(400, VERIFY_CODES[-len] ?? "repository_query_failed");
+    }
+    if (len === 0) {
+      return null;
+    }
+    const repository = new TextDecoder().decode(
+      new Uint8Array(exports.memory.buffer, outPtr, len),
+    );
+    return normalizeGitHubRepository(repository);
+  } finally {
+    exports.ff_dealloc(wasmPtr, wasmBytes.byteLength);
+    exports.ff_dealloc(outPtr, 256);
+  }
+}
+
 function githubHeaders(token: string): HeadersInit {
   return {
     accept: "application/vnd.github+json",
@@ -535,51 +495,9 @@ function normalizeGitHubRepository(value: string): string {
   const repository = value.trim().toLowerCase();
   const repo = repository.split("/")[1] ?? "";
   if (!GITHUB_REPO_RE.test(repository) || repo === "." || repo === "..") {
-    throw new HttpError(400, "invalid_wasm_metadata");
+    throw new HttpError(400, "invalid_wasm_repository");
   }
   return repository;
-}
-
-function parseJsonObject(value: string): Record<string, unknown> {
-  try {
-    const parsed = JSON.parse(value);
-    if (!isRecord(parsed)) {
-      throw new Error("not an object");
-    }
-    return parsed;
-  } catch {
-    throw new HttpError(400, "invalid_wasm_metadata");
-  }
-}
-
-function decodeUtf8(bytes: Uint8Array): string {
-  try {
-    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes);
-  } catch {
-    throw new HttpError(400, "invalid_wasm_metadata");
-  }
-}
-
-function readByte(bytes: Uint8Array, offset: number): { value: number; offset: number } {
-  if (offset >= bytes.byteLength) {
-    throw new HttpError(400, "invalid_wasm_metadata");
-  }
-  return { value: bytes[offset], offset: offset + 1 };
-}
-
-function readLebU32(bytes: Uint8Array, offset: number): { value: number; offset: number } {
-  let value = 0;
-  let shift = 0;
-  for (let count = 0; count < 5; count += 1) {
-    const byte = readByte(bytes, offset);
-    offset = byte.offset;
-    value |= (byte.value & 0x7f) << shift;
-    if ((byte.value & 0x80) === 0) {
-      return { value: value >>> 0, offset };
-    }
-    shift += 7;
-  }
-  throw new HttpError(400, "invalid_wasm_metadata");
 }
 
 async function hashWasm(wasm: ArrayBuffer): Promise<string> {

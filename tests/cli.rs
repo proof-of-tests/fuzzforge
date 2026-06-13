@@ -1,6 +1,18 @@
-use std::{fs, process::Command, sync::mpsc, thread};
+use std::{
+    fs,
+    process::Command,
+    sync::{
+        Mutex,
+        atomic::{AtomicU16, Ordering},
+        mpsc,
+    },
+    thread,
+};
 
 use tempfile::tempdir;
+
+static HTTP_TEST_LOCK: Mutex<()> = Mutex::new(());
+static NEXT_TEST_PORT: AtomicU16 = AtomicU16::new(18080);
 
 fn echo_wasm() -> Vec<u8> {
     wat::parse_str(
@@ -26,33 +38,37 @@ fn echo_wasm() -> Vec<u8> {
 }
 
 fn associated_echo_wasm() -> Vec<u8> {
-    with_metadata_section(echo_wasm(), br#"{"github_repository":"owner/repo"}"#)
-}
-
-fn with_metadata_section(mut wasm: Vec<u8>, metadata: &[u8]) -> Vec<u8> {
-    let mut payload = Vec::new();
-    encode_leb_u32("fuzzforge.metadata".len() as u32, &mut payload);
-    payload.extend_from_slice(b"fuzzforge.metadata");
-    payload.extend_from_slice(metadata);
-
-    wasm.push(0);
-    encode_leb_u32(payload.len() as u32, &mut wasm);
-    wasm.extend_from_slice(&payload);
-    wasm
-}
-
-fn encode_leb_u32(mut value: u32, out: &mut Vec<u8>) {
-    loop {
-        let mut byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if value != 0 {
-            byte |= 0x80;
-        }
-        out.push(byte);
-        if value == 0 {
-            break;
-        }
-    }
+    wat::parse_str(
+        r#"
+        (module
+          (import "wasi_snapshot_preview1" "fd_read"
+            (func $fd_read (param i32 i32 i32 i32) (result i32)))
+          (import "wasi_snapshot_preview1" "fd_write"
+            (func $fd_write (param i32 i32 i32 i32) (result i32)))
+          (import "wasi_snapshot_preview1" "args_sizes_get"
+            (func $args_sizes_get (param i32 i32) (result i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 128) "owner/repo")
+          (func (export "_start")
+            (drop (call $args_sizes_get (i32.const 92) (i32.const 96)))
+            (if (i32.gt_u (i32.load (i32.const 92)) (i32.const 1))
+              (then
+                (i32.store (i32.const 0) (i32.const 128))
+                (i32.store (i32.const 4) (i32.const 10))
+                (drop (call $fd_write
+                  (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 100))))
+              (else
+                (i32.store (i32.const 0) (i32.const 16))
+                (i32.store (i32.const 4) (i32.const 64))
+                (drop (call $fd_read
+                  (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 84)))
+                (i32.store (i32.const 8) (i32.const 16))
+                (i32.store (i32.const 12) (i32.load (i32.const 84)))
+                (drop (call $fd_write
+                  (i32.const 1) (i32.const 8) (i32.const 1) (i32.const 88)))))))
+        "#,
+    )
+    .expect("valid wat")
 }
 
 #[test]
@@ -318,6 +334,9 @@ fn save_fuel_interval_must_be_nonzero() {
 
 #[test]
 fn submit_uploads_wasm_and_proof() {
+    let _guard = HTTP_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let temp = tempdir().expect("tempdir");
     let wasm_path = temp.path().join("echo.wasm");
     let store_path = temp.path().join("store");
@@ -337,8 +356,7 @@ fn submit_uploads_wasm_and_proof() {
         .expect("run command");
     assert!(run.status.success(), "stderr: {}", stderr(&run));
 
-    let server = tiny_http::Server::http("127.0.0.1:0").expect("server");
-    let api_url = format!("http://{}", server.server_addr());
+    let (server, api_url) = test_server();
     let expected_hash = blake3::hash(&wasm).to_hex().to_string();
     let (tx, rx) = mpsc::channel();
     let server_thread = thread::spawn(move || {
@@ -404,6 +422,9 @@ fn submit_uploads_wasm_and_proof() {
 
 #[test]
 fn associated_submit_sends_stored_github_token() {
+    let _guard = HTTP_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let temp = tempdir().expect("tempdir");
     let wasm_path = temp.path().join("echo.wasm");
     let store_path = temp.path().join("store");
@@ -431,8 +452,7 @@ fn associated_submit_sends_stored_github_token() {
         .expect("run command");
     assert!(run.status.success(), "stderr: {}", stderr(&run));
 
-    let server = tiny_http::Server::http("127.0.0.1:0").expect("server");
-    let api_url = format!("http://{}", server.server_addr());
+    let (server, api_url) = test_server();
     let expected_hash = blake3::hash(&wasm).to_hex().to_string();
     let (tx, rx) = mpsc::channel();
     let server_thread = thread::spawn(move || {
@@ -517,6 +537,16 @@ fn associated_submit_without_token_fails_before_upload() {
         .expect("submit command");
     assert!(!submit.status.success());
     assert!(stderr(&submit).contains("fuzzforge auth login"));
+}
+
+fn test_server() -> (tiny_http::Server, String) {
+    for _ in 0..100 {
+        let port = NEXT_TEST_PORT.fetch_add(1, Ordering::Relaxed);
+        if let Ok(server) = tiny_http::Server::http(format!("[::1]:{port}")) {
+            return (server, format!("http://[::1]:{port}"));
+        }
+    }
+    panic!("failed to bind test HTTP server")
 }
 
 fn stdout(output: &std::process::Output) -> String {

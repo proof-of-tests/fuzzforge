@@ -6,9 +6,9 @@ const WASM_HEX =
   "0061736d0100000001040160000003020100070a01065f737461727400000a040102000b";
 const WASM = hexToBytes(WASM_HEX);
 const ASSOCIATED_PROGRAM_HASH =
-  "dd4ffef9a099126e58677d9f1a695d3072512cadedb5625441e8459d473fd1ef";
+  "1e55c5223e1a4c1e58de006a144c2af829f7cbb9406ac2c45c11292f8439b786";
 const ASSOCIATED_WASM_HEX =
-  "0061736d0100000001040160000003020100070a01065f737461727400000a040102000b00351266757a7a666f7267652e6d657461646174617b226769746875625f7265706f7369746f7279223a226f776e65722f7265706f227d";
+  "0061736d0100000001120360027f7f017f60047f7f7f7f017f600000024b0216776173695f736e617073686f745f70726576696577310e617267735f73697a65735f676574000016776173695f736e617073686f745f70726576696577310866645f77726974650001030201020503010001071302066d656d6f72790200065f737461727400020a3401320041dc0041e00010001a41dc0028020041014b044041004180013602004104410a36020041014100410141e40010011a0b0b0b1101004180010b0a6f776e65722f7265706f";
 const ASSOCIATED_WASM = hexToBytes(ASSOCIATED_WASM_HEX);
 const OBSERVATIONS = [
   {
@@ -99,7 +99,7 @@ describe("fuzzforge worker api", () => {
     await expect(put.json()).resolves.toEqual({ error: "wasm_hash_mismatch" });
   });
 
-  test("does not call github when associated wasm hash mismatches", async () => {
+  test("does not query repository when wasm hash mismatches", async () => {
     const put = await SELF.fetch(`https://example.com/api/programs/${"a".repeat(64)}/wasm`, {
       method: "PUT",
       body: ASSOCIATED_WASM,
@@ -195,19 +195,6 @@ describe("fuzzforge worker api", () => {
       github_verified_by: "alice",
       wasm_bytes: ASSOCIATED_WASM.byteLength,
     });
-  });
-
-  test("rejects malformed wasm metadata", async () => {
-    const invalid = withMetadata(WASM, new Uint8Array([0xff]));
-    const put = await SELF.fetch(
-      "https://example.com/api/programs/70420d3bec5c2e28dc02689b899f36c7ac8c3889f0c2a9ea336eb9e898566000/wasm",
-      {
-        method: "PUT",
-        body: invalid,
-      },
-    );
-    expect(put.status).toBe(400);
-    await expect(put.json()).resolves.toEqual({ error: "invalid_wasm_metadata" });
   });
 
   test("allows authorization header in cors preflight", async () => {
@@ -413,33 +400,4 @@ function mockGitHubPermissionResponse(status: number, body: object) {
       path: "/repos/owner/repo/collaborators/alice/permission",
     })
     .reply(status, body, { headers: { "content-type": "application/json" } });
-}
-
-function withMetadata(wasm: Uint8Array, metadata: Uint8Array): Uint8Array {
-  const name = new TextEncoder().encode("fuzzforge.metadata");
-  const payload = concat([encodeLebU32(name.byteLength), name, metadata]);
-  return concat([wasm, new Uint8Array([0]), encodeLebU32(payload.byteLength), payload]);
-}
-
-function encodeLebU32(value: number): Uint8Array {
-  const bytes = [];
-  do {
-    let byte = value & 0x7f;
-    value >>>= 7;
-    if (value !== 0) {
-      byte |= 0x80;
-    }
-    bytes.push(byte);
-  } while (value !== 0);
-  return new Uint8Array(bytes);
-}
-
-function concat(parts: Uint8Array[]): Uint8Array {
-  const out = new Uint8Array(parts.reduce((sum, part) => sum + part.byteLength, 0));
-  let offset = 0;
-  for (const part of parts) {
-    out.set(part, offset);
-    offset += part.byteLength;
-  }
-  return out;
 }

@@ -17,9 +17,8 @@ pub const DEFAULT_FUEL: u64 = 10_000_000;
 pub const DEFAULT_SAVE_FUEL_INTERVAL: u64 = DEFAULT_FUEL * 100;
 pub const DEFAULT_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_SEED_BYTES: usize = 32;
-pub const WASM_METADATA_SECTION: &str = "fuzzforge.metadata";
 const DEFAULT_TABLE_ELEMENTS: usize = 10_000;
-const MAX_WASM_METADATA_BYTES: usize = 4096;
+const REPOSITORY_QUERY_ARGS: [&[u8]; 2] = [b"fuzzforge", b"--repository"];
 
 const WASI_MODULE: &str = "wasi_snapshot_preview1";
 const ERR_SUCCESS: i32 = 0;
@@ -38,16 +37,6 @@ pub struct RunConfig {
     pub fuel: u64,
     pub memory_bytes: usize,
     pub invoke: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WasmMetadata {
-    pub github_repository: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawWasmMetadata {
-    github_repository: String,
 }
 
 impl Default for RunConfig {
@@ -418,55 +407,33 @@ pub fn hash_wasm_file(path: &Path) -> Result<String> {
     Ok(hash_bytes_hex(&bytes))
 }
 
-pub fn parse_wasm_metadata(wasm: &[u8]) -> Result<WasmMetadata> {
-    if wasm.len() < 8 || &wasm[..4] != b"\0asm" || &wasm[4..8] != b"\x01\0\0\0" {
-        bail!("invalid WASM module header");
-    }
-
-    let mut offset = 8;
-    let mut github_repository = None;
-    while offset < wasm.len() {
-        let section_id = read_byte(wasm, &mut offset)?;
-        let section_len = read_leb_u32(wasm, &mut offset)? as usize;
-        let section_end = offset
-            .checked_add(section_len)
-            .filter(|end| *end <= wasm.len())
-            .context("invalid WASM section length")?;
-
-        if section_id == 0 {
-            let mut custom_offset = offset;
-            let name_len = read_leb_u32(wasm, &mut custom_offset)? as usize;
-            let name_end = custom_offset
-                .checked_add(name_len)
-                .filter(|end| *end <= section_end)
-                .context("invalid WASM custom section name length")?;
-            let name = std::str::from_utf8(&wasm[custom_offset..name_end])
-                .context("invalid WASM custom section name")?;
-            if name == WASM_METADATA_SECTION {
-                if github_repository.is_some() {
-                    bail!("duplicate {WASM_METADATA_SECTION} custom section");
-                }
-                let metadata = &wasm[name_end..section_end];
-                if metadata.len() > MAX_WASM_METADATA_BYTES {
-                    bail!("{WASM_METADATA_SECTION} custom section is too large");
-                }
-                let metadata =
-                    std::str::from_utf8(metadata).context("WASM metadata is not UTF-8")?;
-                let raw: RawWasmMetadata =
-                    serde_json::from_str(metadata).context("failed to parse WASM metadata JSON")?;
-                github_repository = Some(normalize_github_repository(&raw.github_repository)?);
-            }
-        }
-
-        offset = section_end;
-    }
-
-    Ok(WasmMetadata { github_repository })
+pub fn query_wasm_repository_file(path: &Path) -> Result<Option<String>> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    query_wasm_repository(&bytes)
 }
 
-pub fn parse_wasm_metadata_file(path: &Path) -> Result<WasmMetadata> {
-    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    parse_wasm_metadata(&bytes)
+pub fn query_wasm_repository(wasm: &[u8]) -> Result<Option<String>> {
+    let program = WasmProgram::compile(wasm)?;
+    let output = program
+        .execute_with_args(
+            Vec::new(),
+            RunConfig::default(),
+            REPOSITORY_QUERY_ARGS
+                .iter()
+                .map(|arg| arg.to_vec())
+                .collect(),
+        )
+        .context("failed to query WASM repository")?;
+    if output.status != RunStatus::Success {
+        return Ok(None);
+    }
+    let stdout = std::str::from_utf8(&output.stdout)
+        .context("WASM repository response is not valid UTF-8")?
+        .trim();
+    if stdout.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(normalize_github_repository(stdout)?))
 }
 
 fn normalize_github_repository(value: &str) -> Result<String> {
@@ -501,29 +468,6 @@ fn is_valid_github_repo(repo: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
         && repo != "."
         && repo != ".."
-}
-
-fn read_byte(bytes: &[u8], offset: &mut usize) -> Result<u8> {
-    let byte = bytes
-        .get(*offset)
-        .copied()
-        .context("unexpected end of WASM")?;
-    *offset += 1;
-    Ok(byte)
-}
-
-fn read_leb_u32(bytes: &[u8], offset: &mut usize) -> Result<u32> {
-    let mut value = 0u32;
-    let mut shift = 0;
-    for _ in 0..5 {
-        let byte = read_byte(bytes, offset)?;
-        value |= u32::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Ok(value);
-        }
-        shift += 7;
-    }
-    bail!("invalid WASM u32 LEB128 value")
 }
 
 pub fn generate_seed(seed_bytes: usize) -> Result<Vec<u8>> {
@@ -602,6 +546,15 @@ impl WasmProgram {
     }
 
     fn execute(&self, stdin: Vec<u8>, config: RunConfig) -> Result<ExecutionOutput> {
+        self.execute_with_args(stdin, config, Vec::new())
+    }
+
+    fn execute_with_args(
+        &self,
+        stdin: Vec<u8>,
+        config: RunConfig,
+        args: Vec<Vec<u8>>,
+    ) -> Result<ExecutionOutput> {
         let limits = StoreLimitsBuilder::new()
             .memory_size(config.memory_bytes)
             .table_elements(DEFAULT_TABLE_ELEMENTS)
@@ -611,6 +564,7 @@ impl WasmProgram {
             .trap_on_grow_failure(true)
             .build();
         let state = HostState {
+            args,
             stdin,
             stdin_pos: 0,
             stdout: Vec::new(),
@@ -909,6 +863,7 @@ struct ExecutionOutput {
 
 #[derive(Debug)]
 struct HostState {
+    args: Vec<Vec<u8>>,
     stdin: Vec<u8>,
     stdin_pos: usize,
     stdout: Vec<u8>,
@@ -1049,14 +1004,41 @@ fn args_sizes_get(mut caller: Caller<'_, HostState>, argc: i32, argv_buf_size: i
     let Some(memory) = guest_memory(&caller) else {
         return ERR_FAULT;
     };
-    let first = write_u32(&memory, &mut caller, argc, 0);
+    let arg_count = caller.data().args.len();
+    let buf_size = caller
+        .data()
+        .args
+        .iter()
+        .map(|arg| arg.len().saturating_add(1))
+        .sum::<usize>();
+    let first = write_u32(&memory, &mut caller, argc, arg_count as u32);
     if first != ERR_SUCCESS {
         return first;
     }
-    write_u32(&memory, &mut caller, argv_buf_size, 0)
+    write_u32(&memory, &mut caller, argv_buf_size, buf_size as u32)
 }
 
-fn args_get(_caller: Caller<'_, HostState>, _argv: i32, _argv_buf: i32) -> i32 {
+fn args_get(mut caller: Caller<'_, HostState>, argv: i32, argv_buf: i32) -> i32 {
+    let Some(memory) = guest_memory(&caller) else {
+        return ERR_FAULT;
+    };
+    let args = caller.data().args.clone();
+    let mut buf_offset = ptr_to_usize(argv_buf);
+    for (index, arg) in args.iter().enumerate() {
+        let ptr = ptr_to_usize(argv).saturating_add(index.saturating_mul(4));
+        let code = write_u32(&memory, &mut caller, ptr as i32, buf_offset as u32);
+        if code != ERR_SUCCESS {
+            return code;
+        }
+        if memory.write(&mut caller, buf_offset, arg).is_err() {
+            return ERR_FAULT;
+        }
+        buf_offset = buf_offset.saturating_add(arg.len());
+        if memory.write(&mut caller, buf_offset, &[0]).is_err() {
+            return ERR_FAULT;
+        }
+        buf_offset = buf_offset.saturating_add(1);
+    }
     ERR_SUCCESS
 }
 
@@ -1188,30 +1170,27 @@ mod tests {
         wat::parse_str(wat).expect("valid wat")
     }
 
-    fn with_metadata_section(mut wasm: Vec<u8>, metadata: &[u8]) -> Vec<u8> {
-        let mut payload = Vec::new();
-        encode_leb_u32(WASM_METADATA_SECTION.len() as u32, &mut payload);
-        payload.extend_from_slice(WASM_METADATA_SECTION.as_bytes());
-        payload.extend_from_slice(metadata);
-
-        wasm.push(0);
-        encode_leb_u32(payload.len() as u32, &mut wasm);
-        wasm.extend_from_slice(&payload);
-        wasm
-    }
-
-    fn encode_leb_u32(mut value: u32, out: &mut Vec<u8>) {
-        loop {
-            let mut byte = (value & 0x7f) as u8;
-            value >>= 7;
-            if value != 0 {
-                byte |= 0x80;
-            }
-            out.push(byte);
-            if value == 0 {
-                break;
-            }
-        }
+    fn repository_wasm(repository: &str) -> Vec<u8> {
+        wat_bytes(&format!(
+            r#"
+            (module
+              (import "wasi_snapshot_preview1" "fd_write"
+                (func $fd_write (param i32 i32 i32 i32) (result i32)))
+              (import "wasi_snapshot_preview1" "args_sizes_get"
+                (func $args_sizes_get (param i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 64) "{repository}")
+              (func (export "_start")
+                (drop (call $args_sizes_get (i32.const 0) (i32.const 4)))
+                (if (i32.gt_u (i32.load (i32.const 0)) (i32.const 1))
+                  (then
+                    (i32.store (i32.const 8) (i32.const 64))
+                    (i32.store (i32.const 12) (i32.const {len}))
+                    (drop (call $fd_write
+                      (i32.const 1) (i32.const 8) (i32.const 1) (i32.const 16)))))))
+            "#,
+            len = repository.len()
+        ))
     }
 
     fn stored_observation(seed_hex: &str) -> StoredObservation {
@@ -1233,61 +1212,24 @@ mod tests {
     }
 
     #[test]
-    fn wasm_metadata_is_absent_by_default() {
+    fn wasm_repository_is_absent_by_default() {
         let wasm = wat_bytes(r#"(module (func (export "_start")))"#);
+        assert_eq!(query_wasm_repository(&wasm).unwrap(), None);
+    }
+
+    #[test]
+    fn wasm_repository_query_runs_with_repository_arg() {
+        let wasm = repository_wasm("Owner/Repo_Name");
         assert_eq!(
-            parse_wasm_metadata(&wasm).unwrap(),
-            WasmMetadata {
-                github_repository: None
-            }
+            query_wasm_repository(&wasm).unwrap(),
+            Some("owner/repo_name".to_owned())
         );
     }
 
     #[test]
-    fn wasm_metadata_parses_and_normalizes_github_repository() {
-        let wasm = with_metadata_section(
-            wat_bytes(r#"(module (func (export "_start")))"#),
-            br#"{"github_repository":"Owner/Repo_Name"}"#,
-        );
-        assert_eq!(
-            parse_wasm_metadata(&wasm).unwrap(),
-            WasmMetadata {
-                github_repository: Some("owner/repo_name".to_owned())
-            }
-        );
-    }
-
-    #[test]
-    fn wasm_metadata_rejects_duplicate_sections() {
-        let wasm = with_metadata_section(
-            with_metadata_section(
-                wat_bytes(r#"(module (func (export "_start")))"#),
-                br#"{"github_repository":"owner/repo"}"#,
-            ),
-            br#"{"github_repository":"owner/repo"}"#,
-        );
-        assert!(parse_wasm_metadata(&wasm).is_err());
-    }
-
-    #[test]
-    fn wasm_metadata_rejects_malformed_json() {
-        let wasm = with_metadata_section(wat_bytes(r#"(module)"#), br#"{"github_repository":"#);
-        assert!(parse_wasm_metadata(&wasm).is_err());
-    }
-
-    #[test]
-    fn wasm_metadata_rejects_oversized_payload() {
-        let wasm = with_metadata_section(wat_bytes(r#"(module)"#), &[b' '; 4097]);
-        assert!(parse_wasm_metadata(&wasm).is_err());
-    }
-
-    #[test]
-    fn wasm_metadata_rejects_invalid_repository() {
-        let wasm = with_metadata_section(
-            wat_bytes(r#"(module)"#),
-            br#"{"github_repository":"bad owner/repo"}"#,
-        );
-        assert!(parse_wasm_metadata(&wasm).is_err());
+    fn wasm_repository_query_rejects_invalid_repository() {
+        let wasm = repository_wasm("bad owner/repo");
+        assert!(query_wasm_repository(&wasm).is_err());
     }
 
     #[test]

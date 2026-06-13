@@ -41,16 +41,15 @@ verifier version settings. Version 1 uses the default `fuel`, `memory_bytes`,
 and `_start` invocation.
 
 WASM modules can optionally associate themselves with a GitHub repository by
-including one `fuzzforge.metadata` custom section containing UTF-8 JSON:
-
-```json
-{"github_repository":"owner/repo"}
-```
+handling a `--repository` argument. When run with that argument, the module
+should print `owner/repo` to stdout and exit successfully instead of running a
+fuzz test.
 
 Unassociated WASM uploads do not require authentication. Associated uploads
 require a GitHub App user token for a user with write or admin access to the
-declared repository. Run `fuzzforge auth login` before submitting associated
-WASM. The CLI uses the GitHub App device flow and stores token data under
+reported repository. Run `fuzzforge auth login` before submitting associated
+WASM. Modules that do not print a repository for `--repository` are treated as
+unassociated. The CLI uses the GitHub App device flow and stores token data under
 `$XDG_CONFIG_HOME/fuzzforge/github.json`, or `$HOME/.config/fuzzforge/github.json`
 when `XDG_CONFIG_HOME` is not set.
 
@@ -123,11 +122,13 @@ The Worker API lives in `worker/src/index.ts` and uses:
 - Server-sent events for `GET /api/hash-results/stream`
 
 Uploads are treated as untrusted input. The Worker verifies that uploaded WASM
-bytes match the requested program hash before storing them. If the module has a
-`fuzzforge.metadata` custom section with `github_repository`, the Worker requires
-an `Authorization: Bearer <token>` header, checks `GET /user`, then checks
-`GET /repos/:owner/:repo/collaborators/:login/permission`, accepting only
-`write` or `admin`. Unassociated WASM uploads remain unauthenticated.
+bytes match the requested program hash before storing them. The Worker then runs
+the module with empty stdin and argv `fuzzforge --repository`. If that execution
+prints a repository, the Worker requires an `Authorization: Bearer <token>`
+header, checks `GET /user`, then checks
+`GET /repos/:owner/:repo/collaborators/:login/permission`, accepting only `write`
+or `admin`. Empty output or a non-success exit means the module is unassociated
+and the upload remains unauthenticated.
 
 Proof uploads are verified inside the Worker with a Rust/wasmi verifier compiled
 to WASM: each submitted observation is rerun against the stored WASM, and only
