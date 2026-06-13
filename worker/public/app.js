@@ -338,21 +338,13 @@ async function runProgram(program) {
 }
 
 async function submitObservation(programHash, observation) {
-  const buckets = Array.from({ length: HLL_BUCKETS }, () => null);
-  buckets[observation.bucket_index] = {
-    seed_hex: observation.seed_hex,
-    verifier_version: observation.verifier_version,
-    observation_hash: observation.observation_hash,
-  };
-
   const response = await fetch(`/api/programs/${programHash}/proof`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      schema_version: 2,
-      program_hash: programHash,
-      precision: HLL_PRECISION,
-      buckets,
+      seed_hex: observation.seed_hex,
+      verifier_version: observation.verifier_version,
+      observation_hash: observation.observation_hash,
     }),
   });
   if (!response.ok) {

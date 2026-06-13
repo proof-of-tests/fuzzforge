@@ -84,6 +84,10 @@ interface WasmMetadata {
   version: string | null;
 }
 
+interface ProofVerificationReport {
+  fuel_consumed: number;
+}
+
 const HASH_RE = /^[0-9a-f]{64}$/;
 const SEED_RE = /^(?:[0-9a-f]{2})+$/;
 const GITHUB_REPO_RE = /^[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?\/[a-z0-9._-]{1,100}$/;
@@ -109,7 +113,14 @@ type VerifierExports = {
   ff_hash_hex(wasmPtr: number, wasmLen: number, outPtr: number, outLen: number): number;
   ff_metadata(wasmPtr: number, wasmLen: number, outPtr: number, outLen: number): number;
   ff_estimate_fuel(wasmPtr: number, wasmLen: number, outPtr: number, outLen: number): number;
-  ff_verify(wasmPtr: number, wasmLen: number, recordPtr: number, recordLen: number): number;
+  ff_verify(
+    wasmPtr: number,
+    wasmLen: number,
+    observationPtr: number,
+    observationLen: number,
+    outPtr: number,
+    outLen: number,
+  ): number;
 };
 
 let verifierPromise: Promise<VerifierExports> | undefined;
@@ -387,56 +398,96 @@ async function listPrograms(url: URL, env: Env): Promise<Response> {
 }
 
 async function putProof(request: Request, env: Env, programHash: string): Promise<Response> {
-  const record = validateHllRecord(await request.json(), programHash);
+  const observation = validateProofObservation(await request.json());
+  const bucket = observationBucket(observation.observation_hash);
+  const previousObservationHash = await loadBucketObservationHash(env, programHash, bucket.index);
+  if (
+    previousObservationHash !== null &&
+    previousObservationHash < observation.observation_hash
+  ) {
+    throw new HttpError(409, "observation_not_improved");
+  }
+
   const wasmObject = await env.WASM_BUCKET.get(wasmKey(programHash));
   if (wasmObject === null) {
     throw new HttpError(404, "wasm_not_found");
   }
   const wasm = await wasmObject.arrayBuffer();
-  await verifyProof(wasm, record);
+  const verification = await verifyProof(wasm, observation);
 
-  const statements: D1PreparedStatement[] = [];
-
-  for (const observation of record.buckets) {
-    if (observation === null) {
-      continue;
-    }
-    const bucket = observationBucket(observation.observation_hash);
-    statements.push(
-      env.DB.prepare(
-        `INSERT INTO hll_buckets (
-          program_hash,
-          bucket_index,
-          verifier_version,
-          observation_hash,
-          seed_hex
-        )
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(program_hash, bucket_index) DO UPDATE SET
-          verifier_version = excluded.verifier_version,
-          observation_hash = excluded.observation_hash,
-          seed_hex = excluded.seed_hex
-         WHERE excluded.observation_hash < hll_buckets.observation_hash`,
-      ).bind(
-        programHash,
-        bucket.index,
-        CURRENT_VERIFIER_VERSION,
-        observation.observation_hash,
-        observation.seed_hex,
-      ),
-    );
-  }
+  const statements: D1PreparedStatement[] = [
+    fuelEstimateUpdateStatement(env, programHash, verification),
+  ];
+  statements.push(
+    env.DB.prepare(
+      `INSERT INTO hll_buckets (
+        program_hash,
+        bucket_index,
+        verifier_version,
+        observation_hash,
+        seed_hex
+      )
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(program_hash, bucket_index) DO UPDATE SET
+        verifier_version = excluded.verifier_version,
+        observation_hash = excluded.observation_hash,
+        seed_hex = excluded.seed_hex
+       WHERE excluded.observation_hash < hll_buckets.observation_hash`,
+    ).bind(
+      programHash,
+      bucket.index,
+      CURRENT_VERIFIER_VERSION,
+      observation.observation_hash,
+      observation.seed_hex,
+    ),
+  );
 
   await env.DB.batch(statements);
   const proof = await loadProof(env, programHash);
   const bucketWitnesses = proof.buckets.filter((bucket) => bucket !== null).length;
-  const verifiedWitnesses = record.buckets.filter((bucket) => bucket !== null).length;
   return json({
     program_hash: programHash,
     bucket_witnesses: bucketWitnesses,
     estimated_observations: estimate(bucketsToRegisters(proof.buckets)),
-    verified_observations: verifiedWitnesses,
+    verified_observations: 1,
   });
+}
+
+function fuelEstimateUpdateStatement(
+  env: Env,
+  programHash: string,
+  verification: ProofVerificationReport,
+): D1PreparedStatement {
+  return env.DB.prepare(
+    `UPDATE programs
+     SET
+      average_fuel_consumed =
+        ((COALESCE(average_fuel_consumed, 0) * fuel_samples) + ?) /
+        (fuel_samples + 1),
+      fuel_samples = fuel_samples + 1,
+      updated_at = ?
+     WHERE program_hash = ?`,
+  )
+    .bind(
+      verification.fuel_consumed,
+      new Date().toISOString(),
+      programHash,
+    );
+}
+
+async function loadBucketObservationHash(
+  env: Env,
+  programHash: string,
+  bucketIndex: number,
+): Promise<string | null> {
+  const row = await env.DB.prepare(
+    `SELECT observation_hash
+     FROM hll_buckets
+     WHERE program_hash = ? AND bucket_index = ?`,
+  )
+    .bind(programHash, bucketIndex)
+    .first<{ observation_hash: string }>();
+  return row?.observation_hash ?? null;
 }
 
 async function getProof(env: Env, programHash: string): Promise<Response> {
@@ -619,42 +670,24 @@ function proofBucketSignature(bucket: ProofStreamBucket): string {
   return `${bucket.verifier_version}:${bucket.observation_hash}:${bucket.seed_hex}`;
 }
 
-function validateHllRecord(value: unknown, programHash: string): HllRecord {
+function validateProofObservation(value: unknown): StoredObservation {
   if (!isRecord(value)) {
-    throw new HttpError(400, "invalid_proof");
+    throw new HttpError(400, "invalid_observation");
   }
-  const record = value as Partial<HllRecord>;
-  if (record.program_hash !== programHash) {
-    throw new HttpError(400, "program_hash_mismatch");
+  if (
+    typeof value.seed_hex !== "string" ||
+    typeof value.observation_hash !== "string" ||
+    !SEED_RE.test(value.seed_hex) ||
+    !HASH_RE.test(value.observation_hash) ||
+    value.verifier_version !== CURRENT_VERIFIER_VERSION
+  ) {
+    throw new HttpError(400, "invalid_observation");
   }
-  if (record.schema_version !== 2 || record.precision !== HLL_PRECISION) {
-    throw new HttpError(400, "unsupported_hll_schema");
-  }
-  if (!Array.isArray(record.buckets) || record.buckets.length !== HLL_BUCKETS) {
-    throw new HttpError(400, "invalid_hll_buckets");
-  }
-  for (let index = 0; index < record.buckets.length; index += 1) {
-    const observation = record.buckets[index];
-    if (observation === null) {
-      continue;
-    }
-    if (!isRecord(observation)) {
-      throw new HttpError(400, "invalid_hll_bucket");
-    }
-    if (
-      typeof observation.seed_hex !== "string" ||
-      typeof observation.observation_hash !== "string" ||
-      !SEED_RE.test(observation.seed_hex) ||
-      !HASH_RE.test(observation.observation_hash) ||
-      observation.verifier_version !== CURRENT_VERIFIER_VERSION
-    ) {
-      throw new HttpError(400, "invalid_hll_bucket");
-    }
-    if (observationBucket(observation.observation_hash).index !== index) {
-      throw new HttpError(400, "invalid_hll_bucket");
-    }
-  }
-  return record as HllRecord;
+  return {
+    seed_hex: value.seed_hex,
+    verifier_version: CURRENT_VERIFIER_VERSION,
+    observation_hash: value.observation_hash,
+  };
 }
 
 async function verifyGitHubRepositoryAccess(
@@ -849,25 +882,41 @@ async function hashWasm(wasm: ArrayBuffer): Promise<string> {
   }
 }
 
-async function verifyProof(wasm: ArrayBuffer, record: HllRecord): Promise<void> {
+async function verifyProof(
+  wasm: ArrayBuffer,
+  observation: StoredObservation,
+): Promise<ProofVerificationReport> {
   const exports = await verifierExports();
   const wasmBytes = new Uint8Array(wasm);
-  const recordBytes = new TextEncoder().encode(JSON.stringify(record));
+  const observationBytes = new TextEncoder().encode(JSON.stringify(observation));
   const wasmPtr = copyIntoVerifier(exports, wasmBytes);
-  const recordPtr = copyIntoVerifier(exports, recordBytes);
+  const observationPtr = copyIntoVerifier(exports, observationBytes);
+  const outLen = 8;
+  const outPtr = exports.ff_alloc(outLen);
   try {
     const code = exports.ff_verify(
       wasmPtr,
       wasmBytes.byteLength,
-      recordPtr,
-      recordBytes.byteLength,
+      observationPtr,
+      observationBytes.byteLength,
+      outPtr,
+      outLen,
     );
     if (code !== 0) {
       throw new HttpError(400, VERIFY_CODES[code] ?? "verifier_error");
     }
+    const view = new DataView(exports.memory.buffer, outPtr, outLen);
+    const fuelConsumed = view.getBigUint64(0, true);
+    if (fuelConsumed > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new HttpError(400, "proof_fuel_too_large");
+    }
+    return {
+      fuel_consumed: Number(fuelConsumed),
+    };
   } finally {
     exports.ff_dealloc(wasmPtr, wasmBytes.byteLength);
-    exports.ff_dealloc(recordPtr, recordBytes.byteLength);
+    exports.ff_dealloc(observationPtr, observationBytes.byteLength);
+    exports.ff_dealloc(outPtr, outLen);
   }
 }
 

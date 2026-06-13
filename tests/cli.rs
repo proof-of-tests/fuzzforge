@@ -505,16 +505,16 @@ fn submit_uploads_proof_only() {
     assert_eq!(second.0, "POST");
     assert_eq!(second.1, format!("/api/programs/{expected_hash}/proof"));
     assert_eq!(second.2, None);
-    let proof: serde_json::Value = serde_json::from_slice(&second.3).expect("proof json");
-    assert_eq!(proof["program_hash"], expected_hash);
-    assert_eq!(
-        proof["buckets"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|bucket| !bucket.is_null())
-            .count(),
-        1
+    let observation: serde_json::Value =
+        serde_json::from_slice(&second.3).expect("observation json");
+    assert!(observation.get("program_hash").is_none());
+    assert!(observation.get("buckets").is_none());
+    assert_eq!(observation["seed_hex"], "7375626d6974");
+    assert_eq!(observation["verifier_version"], 1);
+    assert!(
+        observation["observation_hash"]
+            .as_str()
+            .is_some_and(|hash| hash.len() == 64)
     );
 }
 
@@ -767,27 +767,18 @@ fn corpus_downloads_associated_programs_runs_and_submits() {
         requests[3].1,
         format!("/api/programs/{expected_hash}/proof")
     );
-    let proof: serde_json::Value = serde_json::from_slice(&requests[3].3).expect("proof json");
-    let submitted_observation_hash = proof["buckets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find_map(|bucket| bucket["observation_hash"].as_str())
+    let observation: serde_json::Value =
+        serde_json::from_slice(&requests[3].3).expect("observation json");
+    let submitted_observation_hash = observation["observation_hash"]
+        .as_str()
         .expect("submitted observation hash");
     assert!(stdout(&output).contains(&format!(
         "submitted_observation={submitted_observation_hash}"
     )));
     assert_ne!(submitted_observation_hash, expected_hash);
-    assert_eq!(proof["program_hash"], expected_hash);
-    assert_eq!(
-        proof["buckets"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|bucket| !bucket.is_null())
-            .count(),
-        1
-    );
+    assert!(observation.get("program_hash").is_none());
+    assert!(observation.get("buckets").is_none());
+    assert_eq!(observation["verifier_version"], 1);
     assert_eq!(
         fs::read(
             cache_path
