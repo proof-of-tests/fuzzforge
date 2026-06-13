@@ -14,6 +14,7 @@ cargo run -- stats ./test.wasm
 cargo run -- verify ./test.wasm
 cargo run -- list
 cargo run -- auth login
+cargo run -- upload ./test.wasm
 cargo run -- run ./test.wasm --count=100 --submit-url
 cargo run -- submit ./test.wasm
 cargo run -- corpus
@@ -32,14 +33,16 @@ For multi-run batches, fuzzforge keeps the compiled WASM module and HLL record
 in memory, then persists progress after `--save-fuel-interval` guest fuel has
 been consumed and once more at the end of the batch.
 
-Use `--submit-url <url>` on `run` to upload the WASM module and updated HLL
-proof after the batch finishes. Use `--submit-url` without a value to upload to
-the public FuzzForge API at `https://fuzzforge.lemmih.com`. You can also submit
-an existing local proof with `fuzzforge submit <wasm>`. If `--api-url` is omitted
-for network commands, fuzzforge reads `FUZZFORGE_API_URL` and otherwise defaults
-to `https://fuzzforge.lemmih.com`. Submitted proofs must use the current
-verifier version settings. Version 1 uses the default `fuel`, `memory_bytes`,
-and `_start` invocation.
+Use `fuzzforge upload <wasm>` to upload a WASM module to the API. Use
+`--submit-url <url>` on `run` to submit the updated HLL proof after the batch
+finishes. Use `--submit-url` without a value to submit to the public FuzzForge
+API at `https://fuzzforge.lemmih.com`. You can also submit an existing local
+proof with `fuzzforge submit <wasm>`. Proof submission does not upload the WASM
+module, so upload it once before submitting proofs for a new program. If
+`--api-url` is omitted for network commands, fuzzforge reads `FUZZFORGE_API_URL`
+and otherwise defaults to `https://fuzzforge.lemmih.com`. Submitted proofs must
+use the current verifier version settings. Version 1 uses the default `fuel`,
+`memory_bytes`, and `_start` invocation.
 
 Use `fuzzforge corpus` to continuously fetch repository-associated WASM modules
 from the API, download each module, fetch the central proof as the initial HLL
@@ -65,9 +68,9 @@ stdout and exit successfully instead of running a fuzz test:
 `component_name` is optional and may be an empty string. `version` is required
 for `--metadata` responses and must be SemVer.
 
-Unassociated WASM uploads do not require authentication. Associated uploads
+Unassociated WASM uploads do not require authentication. Associated WASM uploads
 require a GitHub App user token for a user with write or admin access to the
-reported repository. Run `fuzzforge auth login` before submitting associated
+reported repository. Run `fuzzforge auth login` before uploading associated
 WASM. Modules that do not print metadata or a repository are treated as
 unassociated. The CLI uses the GitHub App device flow and stores token data
 under `$XDG_CONFIG_HOME/fuzzforge/github.json`, or
