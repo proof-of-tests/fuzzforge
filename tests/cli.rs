@@ -1,12 +1,13 @@
 use std::{
     fs,
-    process::Command,
+    process::{Command, Stdio},
     sync::{
         Mutex,
         atomic::{AtomicU16, Ordering},
         mpsc,
     },
     thread,
+    time::Duration,
 };
 
 use tempfile::tempdir;
@@ -544,6 +545,8 @@ fn corpus_downloads_associated_programs_runs_and_submits() {
     let _guard = HTTP_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let temp = tempdir().expect("tempdir");
+    let cache_path = temp.path().join("cache");
     let wasm = associated_echo_wasm();
     let expected_hash = blake3::hash(&wasm).to_hex().to_string();
 
@@ -614,21 +617,20 @@ fn corpus_downloads_associated_programs_runs_and_submits() {
         }
     });
 
-    let corpus = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
-        .args([
-            "corpus",
-            "--api-url",
-            &api_url,
-            "--fuel-budget=1",
-            "--cycles=1",
-        ])
-        .output()
+    let mut corpus = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
+        .env("XDG_CACHE_HOME", &cache_path)
+        .args(["corpus", "--api-url", &api_url, "--fuel-budget=1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .expect("corpus command");
-    assert!(corpus.status.success(), "stderr: {}", stderr(&corpus));
-    assert!(stdout(&corpus).contains(&format!("submitted_observation={expected_hash}")));
 
     let requests: Vec<_> = (0..4).map(|_| rx.recv().expect("request")).collect();
     server_thread.join().expect("server thread");
+    thread::sleep(Duration::from_millis(50));
+    let _ = corpus.kill();
+    let output = corpus.wait_with_output().expect("corpus output");
+    assert!(stdout(&output).contains(&format!("submitted_observation={expected_hash}")));
     assert_eq!(requests[0].0, "GET");
     assert_eq!(requests[0].1, "/api/programs?associated=true&limit=100");
     assert_eq!(requests[1].0, "GET");
@@ -646,6 +648,16 @@ fn corpus_downloads_associated_programs_runs_and_submits() {
     let proof: serde_json::Value = serde_json::from_slice(&requests[3].3).expect("proof json");
     assert_eq!(proof["program_hash"], expected_hash);
     assert_eq!(proof["observations"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        fs::read(
+            cache_path
+                .join("fuzzforge")
+                .join("wasm")
+                .join(format!("{expected_hash}.wasm"))
+        )
+        .expect("cached wasm"),
+        wasm
+    );
 }
 
 fn test_server() -> (tiny_http::Server, String) {

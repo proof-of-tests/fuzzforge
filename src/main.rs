@@ -145,21 +145,9 @@ enum Command {
         #[arg(long, default_value_t = DEFAULT_CORPUS_FUEL_BUDGET)]
         fuel_budget: u64,
 
-        /// Number of random seed bytes to generate for each run.
-        #[arg(long, default_value_t = DEFAULT_SEED_BYTES)]
-        seed_bytes: usize,
-
         /// HTTP timeout for program downloads and proof submissions.
         #[arg(long, default_value_t = DEFAULT_SUBMIT_TIMEOUT_SECONDS)]
         timeout_seconds: u64,
-
-        /// Limit the number of full corpus cycles. Omit to run forever.
-        #[arg(long)]
-        cycles: Option<usize>,
-
-        /// Seconds to sleep between corpus cycles.
-        #[arg(long, default_value_t = 0)]
-        cycle_sleep_seconds: u64,
     },
 
     /// Watch the live test execution rate from a fuzzforge API.
@@ -353,10 +341,7 @@ fn main() -> Result<()> {
         Command::Corpus {
             api_url,
             fuel_budget,
-            seed_bytes,
             timeout_seconds,
-            cycles,
-            cycle_sleep_seconds,
         } => {
             if fuel_budget == 0 {
                 anyhow::bail!("--fuel-budget must be greater than zero");
@@ -364,18 +349,8 @@ fn main() -> Result<()> {
             if timeout_seconds == 0 {
                 anyhow::bail!("--timeout-seconds must be greater than zero");
             }
-            if cycles == Some(0) {
-                anyhow::bail!("--cycles must be greater than zero");
-            }
             let api_url = api_url_or_env(api_url)?;
-            run_corpus(
-                &api_url,
-                fuel_budget,
-                seed_bytes,
-                Duration::from_secs(timeout_seconds),
-                cycles,
-                Duration::from_secs(cycle_sleep_seconds),
-            )?;
+            run_corpus(&api_url, fuel_budget, Duration::from_secs(timeout_seconds))?;
         }
         Command::Rate {
             api_url,
@@ -391,47 +366,29 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_corpus(
-    api_url: &str,
-    fuel_budget: u64,
-    seed_bytes: usize,
-    timeout: Duration,
-    cycles: Option<usize>,
-    cycle_sleep: Duration,
-) -> Result<()> {
+fn run_corpus(api_url: &str, fuel_budget: u64, timeout: Duration) -> Result<()> {
     let client = Client::builder()
         .timeout(timeout)
         .build()
         .context("failed to build HTTP client")?;
-    let mut completed_cycles = 0usize;
+    let cache_dir = wasm_cache_dir()?;
+    let mut completed_passes = 0usize;
     loop {
         let programs = list_associated_programs(&client, api_url)?;
         eprintln!(
-            "corpus_cycle={} associated_programs={}",
-            completed_cycles + 1,
+            "corpus_pass={} associated_programs={}",
+            completed_passes + 1,
             programs.len()
         );
-        let mut downloads = Vec::with_capacity(programs.len());
         for program in programs {
-            match download_associated_program(&client, api_url, program) {
-                Ok(Some(download)) => downloads.push(download),
+            match load_cached_associated_program(&client, api_url, &cache_dir, program) {
+                Ok(Some(download)) => run_corpus_program(api_url, &client, &download, fuel_budget)
+                    .with_context(|| format!("failed to run {}", download.program.program_hash))?,
                 Ok(None) => {}
                 Err(error) => eprintln!("download_error={error:#}"),
             }
         }
-
-        for download in downloads {
-            run_corpus_program(api_url, &client, &download, fuel_budget, seed_bytes)
-                .with_context(|| format!("failed to run {}", download.program.program_hash))?;
-        }
-
-        completed_cycles = completed_cycles.saturating_add(1);
-        if cycles.is_some_and(|max_cycles| completed_cycles >= max_cycles) {
-            return Ok(());
-        }
-        if !cycle_sleep.is_zero() {
-            thread::sleep(cycle_sleep);
-        }
+        completed_passes = completed_passes.saturating_add(1);
     }
 }
 
@@ -462,11 +419,43 @@ fn list_associated_programs(client: &Client, api_url: &str) -> Result<Vec<Progra
     }
 }
 
-fn download_associated_program(
+fn load_cached_associated_program(
     client: &Client,
     api_url: &str,
+    cache_dir: &PathBuf,
     program: ProgramSummary,
 ) -> Result<Option<CorpusDownload>> {
+    let wasm_path = cache_dir.join(format!("{}.wasm", program.program_hash));
+    let wasm = match fs::read(&wasm_path) {
+        Ok(wasm) => wasm,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            download_wasm_to_cache(client, api_url, cache_dir, &program)?
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", wasm_path.display()));
+        }
+    };
+
+    let actual_hash = hash_bytes_hex(&wasm);
+    if actual_hash == program.program_hash {
+        return validate_cached_associated_program(program, wasm);
+    }
+
+    eprintln!(
+        "cache_hash_mismatch={} path={}",
+        program.program_hash,
+        wasm_path.display()
+    );
+    let wasm = download_wasm_to_cache(client, api_url, cache_dir, &program)?;
+    validate_cached_associated_program(program, wasm)
+}
+
+fn download_wasm_to_cache(
+    client: &Client,
+    api_url: &str,
+    cache_dir: &PathBuf,
+    program: &ProgramSummary,
+) -> Result<Vec<u8>> {
     let base = api_url.trim_end_matches('/');
     let wasm_url = format!("{base}/api/programs/{}/wasm", program.program_hash);
     let response = client
@@ -475,6 +464,33 @@ fn download_associated_program(
         .with_context(|| format!("failed to download WASM from {wasm_url}"))?;
     ensure_success_ref(&response, "WASM download")?;
     let wasm = response.bytes().context("failed to read WASM download")?;
+    let actual_hash = hash_bytes_hex(&wasm);
+    if actual_hash != program.program_hash {
+        anyhow::bail!(
+            "downloaded WASM hash mismatch: expected {}, got {}",
+            program.program_hash,
+            actual_hash
+        );
+    }
+    fs::create_dir_all(cache_dir)
+        .with_context(|| format!("failed to create {}", cache_dir.display()))?;
+    let wasm_path = cache_dir.join(format!("{}.wasm", program.program_hash));
+    let tmp = wasm_path.with_extension(format!("wasm.tmp.{}", std::process::id()));
+    fs::write(&tmp, &wasm).with_context(|| format!("failed to write {}", tmp.display()))?;
+    fs::rename(&tmp, &wasm_path).with_context(|| {
+        format!(
+            "failed to rename {} to {}",
+            tmp.display(),
+            wasm_path.display()
+        )
+    })?;
+    Ok(wasm.to_vec())
+}
+
+fn validate_cached_associated_program(
+    program: ProgramSummary,
+    wasm: Vec<u8>,
+) -> Result<Option<CorpusDownload>> {
     let metadata =
         query_wasm_metadata(&wasm).context("failed to query downloaded WASM metadata")?;
     if metadata
@@ -484,20 +500,7 @@ fn download_associated_program(
         eprintln!("skipped_unassociated={}", program.program_hash);
         return Ok(None);
     }
-
-    let actual_hash = hash_bytes_hex(&wasm);
-    if actual_hash != program.program_hash {
-        anyhow::bail!(
-            "downloaded WASM hash mismatch: expected {}, got {}",
-            program.program_hash,
-            actual_hash
-        );
-    }
-
-    Ok(Some(CorpusDownload {
-        program,
-        wasm: wasm.to_vec(),
-    }))
+    Ok(Some(CorpusDownload { program, wasm }))
 }
 
 fn run_corpus_program(
@@ -505,7 +508,6 @@ fn run_corpus_program(
     client: &Client,
     download: &CorpusDownload,
     fuel_budget: u64,
-    seed_bytes: usize,
 ) -> Result<()> {
     let initial_record = fetch_central_record(client, api_url, &download.program.program_hash)?;
     let mut session = RunSession::from_wasm_bytes_with_record(
@@ -524,7 +526,7 @@ fn run_corpus_program(
     );
     while fuel_spent < fuel_budget {
         let result = session
-            .run(generate_seed(seed_bytes)?)
+            .run(generate_seed(DEFAULT_SEED_BYTES)?)
             .with_context(|| format!("failed to run {}", download.program.program_hash))?;
         fuel_spent = fuel_spent.saturating_add(result.fuel_consumed);
         let proof = single_observation_record(session.record())?;
@@ -836,6 +838,17 @@ fn github_token_path() -> Result<PathBuf> {
             .context("HOME is not set; cannot locate GitHub token store")?,
     };
     Ok(config_home.join("fuzzforge").join("github.json"))
+}
+
+fn wasm_cache_dir() -> Result<PathBuf> {
+    let cache_home = match std::env::var_os("XDG_CACHE_HOME") {
+        Some(value) => PathBuf::from(value),
+        None => std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(".cache"))
+            .context("HOME is not set; cannot locate WASM cache directory")?,
+    };
+    Ok(cache_home.join("fuzzforge").join("wasm"))
 }
 
 fn unix_now() -> Result<u64> {

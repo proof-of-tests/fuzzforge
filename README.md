@@ -46,8 +46,8 @@ from the API, download each module, fetch the central proof as the initial HLL
 state, spend `10_000_000_000` guest fuel on each program using generated seeds,
 upload each new proof entry as soon as it is found, and then start the corpus
 again. The command only runs modules whose metadata reports a
-`github_repository`. Use `--cycles <n>` for a finite number of corpus passes, or
-`--fuel-budget <fuel>` to override the per-program fuel budget.
+`github_repository`. Downloaded modules are cached under the user cache
+directory. Use `--fuel-budget <fuel>` to override the per-program fuel budget.
 
 WASM modules can optionally report FuzzForge metadata by handling a `--metadata`
 argument. When run with that argument, the module should print a JSON object to
