@@ -13,36 +13,20 @@ const ASSOCIATED_WASM = hexToBytes(ASSOCIATED_WASM_HEX);
 const OBSERVATIONS = [
   {
     seed_hex: "00",
-    stdout_hash: "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
-    status: "Success",
-    fuel_consumed: 16,
-    config: {
-      fuel: 100,
-      memory_bytes: 65536,
-      invoke: null,
-    },
-    observation_hash: "bd1879579ace4829d2edd6542a21894f79408e18d874f5e58eff3f0c0fe860a1",
+    observation_hash: "aeb47a6b97e7b4c3291bc0e379cfe9f65b2185c797c40c581375b6c770df9ff9",
   },
   {
     seed_hex: "01",
-    stdout_hash: "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
-    status: "Success",
-    fuel_consumed: 16,
-    config: {
-      fuel: 100,
-      memory_bytes: 65536,
-      invoke: null,
-    },
-    observation_hash: "a25fe64ecb5ea49bc2319da08cdb696e53a2bc64b7d034f34442badc78fcfc18",
+    observation_hash: "a5fd96b85a17d6709fa02775e296c4e853d709bd7bbd6926463ee3154d3e29c1",
   },
 ];
-const SAME_BUCKET_LOW_RANK = {
+const SAME_BUCKET_HIGH_HASH = {
   seed_hex: "00000006",
-  observation_hash: "ab2cfe5f1a881a0ec45d99951e0a2bb365a447eee4de03261a1306517c132fdf",
+  observation_hash: "2bd1ebda0e82a323eef9073b3e0ec316102a8c62b0ecfc9649e71111bed10b5e",
 };
-const SAME_BUCKET_HIGH_RANK = {
-  seed_hex: "00000002",
-  observation_hash: "a8a888e5f36a182596943198be5f71264244acf1ab70b443d62a2f13ebd8c869",
+const SAME_BUCKET_LOW_HASH = {
+  seed_hex: "00000004",
+  observation_hash: "2b4eabbaa058ea77931c0180a3980e3b6d0cc9e12dc5caf15354b4e6de084a1e",
 };
 
 describe("fuzzforge worker api", () => {
@@ -278,15 +262,19 @@ describe("fuzzforge worker api", () => {
 
     const fetched = await SELF.fetch(`https://example.com/api/programs/${PROGRAM_HASH}/proof`);
     expect(fetched.status).toBe(200);
-    const proof = (await fetched.json()) as { program_hash: string; observations: unknown[] };
+    const proof = (await fetched.json()) as {
+      program_hash: string;
+      buckets: Array<{ observation_hash: string } | null>;
+    };
     expect(proof.program_hash).toBe(PROGRAM_HASH);
-    expect(proof.observations).toEqual(
+    const witnesses = proof.buckets.filter((bucket) => bucket !== null);
+    expect(witnesses).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ observation_hash: OBSERVATIONS[0].observation_hash }),
         expect.objectContaining({ observation_hash: OBSERVATIONS[1].observation_hash }),
       ]),
     );
-    expect(proof.observations).toHaveLength(2);
+    expect(witnesses).toHaveLength(2);
 
     const results = await SELF.fetch("https://example.com/api/hash-results");
     expect(results.status).toBe(200);
@@ -307,14 +295,15 @@ describe("fuzzforge worker api", () => {
 
     const proof = (await (
       await SELF.fetch(`https://example.com/api/programs/${PROGRAM_HASH}/proof`)
-    ).json()) as { observations: Array<{ observation_hash: string }> };
-    expect(proof.observations.map((observation) => observation.observation_hash)).toEqual(
+    ).json()) as { buckets: Array<{ observation_hash: string } | null> };
+    const witnesses = proof.buckets.filter((bucket) => bucket !== null);
+    expect(witnesses.map((observation) => observation.observation_hash)).toEqual(
       expect.arrayContaining([
         OBSERVATIONS[0].observation_hash,
         OBSERVATIONS[1].observation_hash,
       ]),
     );
-    expect(proof.observations).toHaveLength(2);
+    expect(witnesses).toHaveLength(2);
 
     const row = await env.DB.prepare(
       "SELECT COUNT(*) AS count FROM hll_buckets WHERE program_hash = ?",
@@ -324,21 +313,20 @@ describe("fuzzforge worker api", () => {
     expect(row?.count).toBe(2);
   });
 
-  test("same-bucket writes keep the highest-rank witness without storing rank", async () => {
+  test("same-bucket writes keep the lower observation hash witness", async () => {
     await uploadWasm();
 
-    const first = await submitProof(proofRecord([SAME_BUCKET_LOW_RANK]));
+    const first = await submitProof(proofRecord([SAME_BUCKET_HIGH_HASH]));
     expect(first.status, await first.clone().text()).toBe(200);
-    const second = await submitProof(proofRecord([SAME_BUCKET_HIGH_RANK]));
+    const second = await submitProof(proofRecord([SAME_BUCKET_LOW_HASH]));
     expect(second.status, await second.clone().text()).toBe(200);
 
     const proof = (await (
       await SELF.fetch(`https://example.com/api/programs/${PROGRAM_HASH}/proof`)
-    ).json()) as { observations: Array<{ observation_hash: string }> };
-    expect(proof.observations).toHaveLength(1);
-    expect(proof.observations[0].observation_hash).toBe(
-      SAME_BUCKET_HIGH_RANK.observation_hash,
-    );
+    ).json()) as { buckets: Array<{ observation_hash: string } | null> };
+    const witnesses = proof.buckets.filter((bucket) => bucket !== null);
+    expect(witnesses).toHaveLength(1);
+    expect(witnesses[0].observation_hash).toBe(SAME_BUCKET_LOW_HASH.observation_hash);
   });
 
   test("rejects tampered observations before writing hash results", async () => {
@@ -370,6 +358,21 @@ describe("fuzzforge worker api", () => {
     });
     expect(response.status).toBe(400);
     await expect(response.json()).resolves.toEqual({ error: "program_hash_mismatch" });
+  });
+
+  test("rejects proof records with malformed bucket witnesses", async () => {
+    await uploadWasm();
+    const malformed = proofRecord([OBSERVATIONS[0]]);
+    const bucket = observationBucket(OBSERVATIONS[0].observation_hash);
+    malformed.buckets[bucket] = {
+      seed_hex: "0",
+      verifier_version: 1,
+      observation_hash: OBSERVATIONS[0].observation_hash,
+    };
+
+    const response = await submitProof(malformed);
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ error: "invalid_hll_bucket" });
   });
 
   test("streams live counter events after verified writes", async () => {
@@ -410,16 +413,26 @@ function submitProof(record: unknown): Promise<Response> {
   });
 }
 
-function proofRecord(observations: unknown[]) {
+function proofRecord(observations: Array<{ seed_hex: string; observation_hash: string }>) {
+  const buckets: Array<object | null> = Array.from({ length: 64 }, () => null);
+  for (const observation of observations) {
+    buckets[observationBucket(observation.observation_hash)] = {
+      seed_hex: observation.seed_hex,
+      verifier_version: 1,
+      observation_hash: observation.observation_hash,
+    };
+  }
   return {
     schema_version: 2,
     program_hash: PROGRAM_HASH,
     precision: 6,
-    sketch: {
-      registers: Array.from({ length: 64 }, () => 0),
-    },
-    observations,
+    buckets,
   };
+}
+
+function observationBucket(observationHash: string): number {
+  const value = BigInt(`0x${observationHash.slice(0, 16)}`);
+  return Number(value >> 58n);
 }
 
 function hexToBytes(hex: string): Uint8Array {

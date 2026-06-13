@@ -1,7 +1,7 @@
 # FuzzForge
 
 FuzzForge runs deterministic local WebAssembly fuzz tests with `wasmi` and stores
-compact HyperLogLog observations per WASM program hash.
+compact HyperLogLog bucket witnesses per WASM program hash.
 
 ## Usage
 
@@ -21,10 +21,10 @@ cargo run -- rate
 ```
 
 The `run` command sends a seed to the guest as stdin. If `--seed <hex>` is not
-provided, fuzzforge generates random seeds and stores them with each observation.
-Use `--count <n>` to execute multiple runs with different generated seeds.
-`--seed` is accepted only when `--count=1`. Captured guest stdout is stored and
-hashed, but never forwarded to process stdout. The command prints the previous
+provided, fuzzforge generates random seeds. Use `--count <n>` to execute
+multiple runs with different generated seeds. `--seed` is accepted only when
+`--count=1`. Captured guest stdout is hashed into the observation hash, but is
+not persisted or forwarded to process stdout. The command prints the previous
 HLL estimate as `proven_before=<estimate>`, then updates
 `proven_added=<estimate>` after each HLL sketch update. When stderr is a
 terminal, the progress line includes a spinner while a run is executing.
@@ -112,21 +112,23 @@ or unsupported WASI APIs are rejected before execution.
 HLL records live under `.fuzzforge/hll/<program-hash>.json` by default.
 Program hashes are lowercase BLAKE3 hashes of the raw WASM bytes.
 
-Each run stores its seed and expected result, then inserts one execution
-observation into a fixed-size HLL sketch:
+Each run creates one execution observation hash. The HLL record keeps only the
+best witness for each fixed bucket:
 
-- program hash
 - seed bytes as hex
-- stdout hash
-- exit/trap status
-- fuel consumed
+- verifier version
+- observation hash
 
-`fuzzforge verify` reloads the stored seeds, reruns the program, checks that the
-new output/status/fuel match the stored expected values, and rebuilds the HLL
-registers to ensure the persisted sketch matches the verifiable observations.
+`fuzzforge verify` reloads the stored bucket witnesses, reruns the program from
+each witness seed using the recorded verifier version, and rebuilds the HLL
+buckets to ensure the persisted witnesses are verifiable.
+Observation hashes include the program hash, seed, stdout hash, exit/trap
+status, and verifier-version execution settings. They intentionally exclude
+fuel consumed, because compact bucket records do not preserve original run order.
 
 The HLL precision is fixed at `p = 6`, which means `2^6 = 64` buckets. This is
 intentionally compact and coarse, with an expected relative error of roughly 13%.
+Records therefore store at most 64 witnesses per program.
 The sketch implementation is maintained in this crate instead of depending on
 an external HyperLogLog package.
 
@@ -152,9 +154,8 @@ or a non-success exit means the module is unassociated and the upload remains
 unauthenticated.
 
 Proof uploads are verified inside the Worker with a Rust/wasmi verifier compiled
-to WASM: each submitted observation is rerun against the stored WASM, and only
-newly verified observations are merged into the server-owned HLL buckets. The
-uploaded sketch is never accepted as the canonical aggregate.
+to WASM: each submitted bucket witness is rerun against the stored WASM, and
+only newly verified witnesses are merged into the server-owned HLL buckets.
 
 D1 stores one program metadata row per uploaded WASM and at most `2^6 = 64` HLL
 bucket witness rows per program. WASM bytes live in R2 at the deterministic

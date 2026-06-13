@@ -16,8 +16,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use fuzzforge::{
     DEFAULT_FUEL, DEFAULT_MEMORY_BYTES, DEFAULT_SAVE_FUEL_INTERVAL, DEFAULT_SEED_BYTES,
-    HLL_PRECISION, HllRecord, RunConfig, RunSession, Sketch, Store, generate_seed, hash_bytes_hex,
-    hash_wasm_file, query_wasm_metadata, seed_from_hex, verify_wasm,
+    HLL_PRECISION, HllRecord, RunConfig, RunSession, Store, StoredObservation, generate_seed,
+    hash_bytes_hex, hash_wasm_file, query_wasm_metadata, seed_from_hex, verify_wasm,
 };
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -535,8 +535,12 @@ fn run_corpus_program(
             .run(generate_seed(DEFAULT_SEED_BYTES)?)
             .with_context(|| format!("failed to run {}", download.program.program_hash))?;
         fuel_spent = fuel_spent.saturating_add(result.fuel_consumed);
-        let proof = single_observation_record(session.record())?;
-        let observation_hash = &proof.observations[0].observation_hash;
+        let proof = single_observation_record(
+            session.program_hash(),
+            result.seed_hex.clone(),
+            result.observation_hash.clone(),
+        )?;
+        let observation_hash = &result.observation_hash;
         let bucket = observation_bucket(observation_hash)?;
         if bucket_witnesses
             .get(&bucket)
@@ -595,7 +599,7 @@ fn fetch_central_state(client: &Client, api_url: &str, program_hash: &str) -> Re
         anyhow::bail!("unsupported central proof precision {}", proof.precision);
     }
     let mut bucket_witnesses = HashMap::new();
-    for observation in &proof.observations {
+    for observation in proof.buckets.iter().filter_map(Option::as_ref) {
         let bucket = observation_bucket(&observation.observation_hash)?;
         match bucket_witnesses.get(&bucket) {
             Some(previous) if previous <= &observation.observation_hash => {}
@@ -608,13 +612,7 @@ fn fetch_central_state(client: &Client, api_url: &str, program_hash: &str) -> Re
         schema_version: proof.schema_version,
         program_hash: proof.program_hash,
         precision: proof.precision,
-        run_count: proof.observations.len() as u64,
-        last_observation_hash: proof
-            .observations
-            .last()
-            .map(|observation| observation.observation_hash.clone()),
-        sketch: proof.sketch,
-        observations: Vec::new(),
+        buckets: proof.buckets,
     };
     record.validate()?;
     Ok(CentralState {
@@ -623,13 +621,17 @@ fn fetch_central_state(client: &Client, api_url: &str, program_hash: &str) -> Re
     })
 }
 
-fn single_observation_record(record: &HllRecord) -> Result<HllRecord> {
-    let observation = record
-        .observations
-        .last()
-        .cloned()
-        .context("run did not produce an observation")?;
-    let mut proof = HllRecord::new(record.program_hash.clone());
+fn single_observation_record(
+    program_hash: &str,
+    seed_hex: String,
+    observation_hash: String,
+) -> Result<HllRecord> {
+    let observation = StoredObservation {
+        seed_hex,
+        verifier_version: 1,
+        observation_hash,
+    };
+    let mut proof = HllRecord::new(program_hash.to_owned());
     proof.insert_observation(observation)?;
     Ok(proof)
 }
@@ -651,7 +653,7 @@ fn submit_proof_record(client: &Client, api_url: &str, record: &HllRecord) -> Re
     println!(
         "submitted_observation={} stored_observations={}",
         record.program_hash,
-        record.observations.len()
+        record.bucket_witnesses().count()
     );
     Ok(())
 }
@@ -814,24 +816,23 @@ fn submit_proof(
     println!(
         "submitted_proof={} stored_observations={}",
         record.program_hash,
-        record.observations.len()
+        record.bucket_witnesses().count()
     );
     Ok(())
 }
 
 fn ensure_submit_record_uses_current_verifier(record: &HllRecord) -> Result<()> {
-    let expected = RunConfig::default();
-    for observation in &record.observations {
-        if observation.config != expected {
+    for observation in record.bucket_witnesses() {
+        if observation.verifier_version != 1 {
             anyhow::bail!(
-                "proof submission requires verifier version 1 settings; observation seed {} used a custom config",
-                observation.seed_hex
+                "proof submission requires verifier version 1 settings; observation seed {} used verifier version {}",
+                observation.seed_hex,
+                observation.verifier_version
             );
         }
     }
     Ok(())
 }
-
 fn ensure_success(response: reqwest::blocking::Response, action: &str) -> Result<()> {
     if response.status().is_success() {
         return Ok(());
@@ -955,13 +956,7 @@ struct CentralProof {
     schema_version: u32,
     program_hash: String,
     precision: u8,
-    sketch: Sketch,
-    observations: Vec<CentralObservation>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CentralObservation {
-    observation_hash: String,
+    buckets: Vec<Option<StoredObservation>>,
 }
 
 struct CorpusDownload {

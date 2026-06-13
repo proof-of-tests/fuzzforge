@@ -173,7 +173,7 @@ fn duplicate_runs_do_not_increase_hll_progress() {
         .output()
         .expect("stats command");
     assert!(stats.status.success(), "stderr: {}", stderr(&stats));
-    assert!(stdout(&stats).contains("stored_observations=2"));
+    assert!(stdout(&stats).contains("stored_observations=1"));
     assert!(stdout(&stats).contains("estimated_observations=1.008"));
 }
 
@@ -216,7 +216,10 @@ fn count_runs_multiple_generated_seeds_and_verifies() {
     assert!(stats.status.success(), "stderr: {}", stderr(&stats));
     let stats_stdout = stdout(&stats);
     assert!(!stats_stdout.contains("runs="));
-    assert!(stats_stdout.contains("stored_observations=2"));
+    assert!(
+        stats_stdout.contains("stored_observations=1")
+            || stats_stdout.contains("stored_observations=2")
+    );
 
     let verify = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
         .args([
@@ -228,12 +231,16 @@ fn count_runs_multiple_generated_seeds_and_verifies() {
         .output()
         .expect("verify command");
     assert!(verify.status.success(), "stderr: {}", stderr(&verify));
-    assert!(stdout(&verify).contains("checked_observations=2"));
-    assert!(stdout(&verify).contains("verification=ok"));
+    let verify_stdout = stdout(&verify);
+    assert!(
+        verify_stdout.contains("checked_observations=1")
+            || verify_stdout.contains("checked_observations=2")
+    );
+    assert!(verify_stdout.contains("verification=ok"));
 }
 
 #[test]
-fn run_progress_ignores_stored_run_counter() {
+fn run_progress_ignores_legacy_stored_run_counter() {
     let temp = tempdir().expect("tempdir");
     let wasm_path = temp.path().join("echo.wasm");
     let store_path = temp.path().join("store");
@@ -418,7 +425,15 @@ fn submit_uploads_wasm_and_proof() {
     assert_eq!(second.2, None);
     let proof: serde_json::Value = serde_json::from_slice(&second.3).expect("proof json");
     assert_eq!(proof["program_hash"], expected_hash);
-    assert_eq!(proof["observations"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        proof["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|bucket| !bucket.is_null())
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -593,10 +608,8 @@ fn corpus_downloads_associated_programs_runs_and_submits() {
                         )
                     }
                     ("GET", path) if path == format!("/api/programs/{expected_hash}/proof") => {
-                        tiny_http::Response::from_string(format!(
-                            r#"{{"schema_version":2,"program_hash":"{expected_hash}","precision":6,"sketch":{{"registers":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}},"observations":[]}}"#
-                        ))
-                        .with_header(
+                        tiny_http::Response::from_string(central_empty_proof(&expected_hash))
+                            .with_header(
                             tiny_http::Header::from_bytes(
                                 b"content-type".as_slice(),
                                 b"application/json".as_slice(),
@@ -647,7 +660,15 @@ fn corpus_downloads_associated_programs_runs_and_submits() {
     );
     let proof: serde_json::Value = serde_json::from_slice(&requests[3].3).expect("proof json");
     assert_eq!(proof["program_hash"], expected_hash);
-    assert_eq!(proof["observations"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        proof["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|bucket| !bucket.is_null())
+            .count(),
+        1
+    );
     assert_eq!(
         fs::read(
             cache_path
@@ -741,7 +762,7 @@ fn test_server() -> (tiny_http::Server, String) {
 }
 
 fn central_minimum_proof(program_hash: &str) -> String {
-    let observations = (0u64..64)
+    let buckets = (0u64..64)
         .map(|bucket| {
             let prefix = bucket << (64 - 6);
             format!(
@@ -753,8 +774,14 @@ fn central_minimum_proof(program_hash: &str) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        r#"{{"schema_version":2,"program_hash":"{program_hash}","precision":6,"sketch":{{"registers":[{}]}},"observations":[{observations}]}}"#,
-        vec!["1"; 64].join(",")
+        r#"{{"schema_version":2,"program_hash":"{program_hash}","precision":6,"buckets":[{buckets}]}}"#
+    )
+}
+
+fn central_empty_proof(program_hash: &str) -> String {
+    format!(
+        r#"{{"schema_version":2,"program_hash":"{program_hash}","precision":6,"buckets":[{}]}}"#,
+        vec!["null"; 64].join(",")
     )
 }
 

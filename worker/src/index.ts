@@ -11,14 +11,13 @@ interface HllRecord {
   schema_version: number;
   program_hash: string;
   precision: number;
-  sketch: { registers: number[] };
-  observations: StoredObservation[];
+  buckets: Array<StoredObservation | null>;
 }
 
 interface StoredObservation {
   seed_hex: string;
   observation_hash: string;
-  verifier_version?: number;
+  verifier_version: number;
 }
 
 interface BucketRow {
@@ -64,6 +63,7 @@ interface WasmMetadata {
 }
 
 const HASH_RE = /^[0-9a-f]{64}$/;
+const SEED_RE = /^(?:[0-9a-f]{2})+$/;
 const GITHUB_REPO_RE = /^[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?\/[a-z0-9._-]{1,100}$/;
 const SEMVER_RE =
   /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/;
@@ -333,7 +333,10 @@ async function putProof(request: Request, env: Env, programHash: string): Promis
 
   const statements: D1PreparedStatement[] = [];
 
-  for (const observation of record.observations) {
+  for (const observation of record.buckets) {
+    if (observation === null) {
+      continue;
+    }
     const bucket = observationBucket(observation.observation_hash);
     statements.push(
       env.DB.prepare(
@@ -362,11 +365,13 @@ async function putProof(request: Request, env: Env, programHash: string): Promis
 
   await env.DB.batch(statements);
   const proof = await loadProof(env, programHash);
+  const bucketWitnesses = proof.buckets.filter((bucket) => bucket !== null).length;
+  const verifiedWitnesses = record.buckets.filter((bucket) => bucket !== null).length;
   return json({
     program_hash: programHash,
-    bucket_witnesses: proof.observations.length,
-    estimated_observations: estimate(proof.sketch.registers),
-    verified_observations: record.observations.length,
+    bucket_witnesses: bucketWitnesses,
+    estimated_observations: estimate(bucketsToRegisters(proof.buckets)),
+    verified_observations: verifiedWitnesses,
   });
 }
 
@@ -381,8 +386,8 @@ async function getStats(env: Env, programHash: string): Promise<Response> {
     schema_version: proof.schema_version,
     precision: proof.precision,
     buckets: HLL_BUCKETS,
-    bucket_witnesses: proof.observations.length,
-    estimated_observations: estimate(proof.sketch.registers),
+    bucket_witnesses: proof.buckets.filter((bucket) => bucket !== null).length,
+    estimated_observations: estimate(bucketsToRegisters(proof.buckets)),
   });
 }
 
@@ -454,32 +459,28 @@ function validateHllRecord(value: unknown, programHash: string): HllRecord {
   if (record.schema_version !== 2 || record.precision !== HLL_PRECISION) {
     throw new HttpError(400, "unsupported_hll_schema");
   }
-  if (!isRecord(record.sketch) || !Array.isArray(record.sketch.registers)) {
-    throw new HttpError(400, "invalid_hll_sketch");
+  if (!Array.isArray(record.buckets) || record.buckets.length !== HLL_BUCKETS) {
+    throw new HttpError(400, "invalid_hll_buckets");
   }
-  if (record.sketch.registers.length !== HLL_BUCKETS) {
-    throw new HttpError(400, "invalid_hll_bucket_count");
-  }
-  if (
-    !record.sketch.registers.every(
-      (rank) => Number.isInteger(rank) && rank >= 0 && rank <= 64,
-    )
-  ) {
-    throw new HttpError(400, "invalid_hll_register");
-  }
-  if (!Array.isArray(record.observations)) {
-    throw new HttpError(400, "invalid_observations");
-  }
-  for (const observation of record.observations) {
+  for (let index = 0; index < record.buckets.length; index += 1) {
+    const observation = record.buckets[index];
+    if (observation === null) {
+      continue;
+    }
     if (!isRecord(observation)) {
-      throw new HttpError(400, "invalid_observation");
+      throw new HttpError(400, "invalid_hll_bucket");
     }
     if (
       typeof observation.seed_hex !== "string" ||
       typeof observation.observation_hash !== "string" ||
-      !HASH_RE.test(observation.observation_hash)
+      !SEED_RE.test(observation.seed_hex) ||
+      !HASH_RE.test(observation.observation_hash) ||
+      observation.verifier_version !== CURRENT_VERIFIER_VERSION
     ) {
-      throw new HttpError(400, "invalid_observation");
+      throw new HttpError(400, "invalid_hll_bucket");
+    }
+    if (observationBucket(observation.observation_hash).index !== index) {
+      throw new HttpError(400, "invalid_hll_bucket");
     }
   }
   return record as HllRecord;
@@ -704,22 +705,22 @@ async function loadProof(env: Env, programHash: string): Promise<HllRecord> {
   if (rows.results.length === 0) {
     throw new HttpError(404, "proof_not_found");
   }
-  const registers = Array.from({ length: HLL_BUCKETS }, () => 0);
-  const observations: StoredObservation[] = [];
+  const buckets: Array<StoredObservation | null> = Array.from(
+    { length: HLL_BUCKETS },
+    () => null,
+  );
   for (const row of rows.results) {
-    registers[row.bucket_index] = observationBucket(row.observation_hash).rank;
-    observations.push({
+    buckets[row.bucket_index] = {
       seed_hex: row.seed_hex,
       verifier_version: row.verifier_version,
       observation_hash: row.observation_hash,
-    });
+    };
   }
   return {
     schema_version: 2,
     program_hash: programHash,
     precision: HLL_PRECISION,
-    sketch: { registers },
-    observations,
+    buckets,
   };
 }
 
@@ -744,6 +745,18 @@ function estimate(registers: number[]): number {
     return m * Math.log(m / zeros);
   }
   return raw;
+}
+
+function bucketsToRegisters(buckets: Array<StoredObservation | null>): number[] {
+  const registers = Array.from({ length: HLL_BUCKETS }, () => 0);
+  for (const observation of buckets) {
+    if (observation === null) {
+      continue;
+    }
+    const bucket = observationBucket(observation.observation_hash);
+    registers[bucket.index] = bucket.rank;
+  }
+  return registers;
 }
 
 function alpha(bucketCount: number): number {
