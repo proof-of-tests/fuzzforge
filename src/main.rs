@@ -542,10 +542,7 @@ fn run_corpus_program(
         )?;
         let observation_hash = &result.observation_hash;
         let bucket = observation_bucket(observation_hash)?;
-        if bucket_witnesses
-            .get(&bucket)
-            .is_some_and(|previous| observation_hash >= previous)
-        {
+        if !observation_improves_bucket(&bucket_witnesses, bucket, observation_hash) {
             skipped_observations = skipped_observations.saturating_add(1);
         } else {
             submit_proof_record(client, api_url, &proof)?;
@@ -601,11 +598,8 @@ fn fetch_central_state(client: &Client, api_url: &str, program_hash: &str) -> Re
     let mut bucket_witnesses = HashMap::new();
     for observation in proof.buckets.iter().filter_map(Option::as_ref) {
         let bucket = observation_bucket(&observation.observation_hash)?;
-        match bucket_witnesses.get(&bucket) {
-            Some(previous) if previous <= &observation.observation_hash => {}
-            _ => {
-                bucket_witnesses.insert(bucket, observation.observation_hash.clone());
-            }
+        if observation_improves_bucket(&bucket_witnesses, bucket, &observation.observation_hash) {
+            bucket_witnesses.insert(bucket, observation.observation_hash.clone());
         }
     }
     let record = HllRecord {
@@ -619,6 +613,16 @@ fn fetch_central_state(client: &Client, api_url: &str, program_hash: &str) -> Re
         record,
         bucket_witnesses,
     })
+}
+
+fn observation_improves_bucket(
+    bucket_witnesses: &HashMap<usize, String>,
+    bucket: usize,
+    observation_hash: &str,
+) -> bool {
+    bucket_witnesses
+        .get(&bucket)
+        .is_none_or(|previous| observation_hash < previous.as_str())
 }
 
 fn single_observation_record(
@@ -650,9 +654,15 @@ fn submit_proof_record(client: &Client, api_url: &str, record: &HllRecord) -> Re
         .send()
         .with_context(|| format!("failed to submit proof to {proof_url}"))?;
     ensure_success(response, "proof submission")?;
+    let observation_hash = record
+        .bucket_witnesses()
+        .next()
+        .context("proof submission record has no observation")?
+        .observation_hash
+        .as_str();
     println!(
         "submitted_observation={} stored_observations={}",
-        record.program_hash,
+        observation_hash,
         record.bucket_witnesses().count()
     );
     Ok(())
@@ -962,6 +972,24 @@ struct CentralProof {
 struct CorpusDownload {
     program: ProgramSummary,
     wasm: Vec<u8>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::observation_improves_bucket;
+
+    #[test]
+    fn corpus_only_submits_observations_that_improve_their_bucket() {
+        let mut bucket_witnesses = HashMap::new();
+        bucket_witnesses.insert(1, "b".to_owned());
+
+        assert!(observation_improves_bucket(&bucket_witnesses, 0, "c"));
+        assert!(observation_improves_bucket(&bucket_witnesses, 1, "a"));
+        assert!(!observation_improves_bucket(&bucket_witnesses, 1, "b"));
+        assert!(!observation_improves_bucket(&bucket_witnesses, 1, "c"));
+    }
 }
 
 fn watch_rate(api_url: &str, window: Duration) -> Result<()> {

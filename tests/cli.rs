@@ -643,7 +643,6 @@ fn corpus_downloads_associated_programs_runs_and_submits() {
     thread::sleep(Duration::from_millis(50));
     let _ = corpus.kill();
     let output = corpus.wait_with_output().expect("corpus output");
-    assert!(stdout(&output).contains(&format!("submitted_observation={expected_hash}")));
     assert_eq!(requests[0].0, "GET");
     assert_eq!(requests[0].1, "/api/programs?associated=true&limit=100");
     assert_eq!(requests[1].0, "GET");
@@ -659,6 +658,16 @@ fn corpus_downloads_associated_programs_runs_and_submits() {
         format!("/api/programs/{expected_hash}/proof")
     );
     let proof: serde_json::Value = serde_json::from_slice(&requests[3].3).expect("proof json");
+    let submitted_observation_hash = proof["buckets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|bucket| bucket["observation_hash"].as_str())
+        .expect("submitted observation hash");
+    assert!(stdout(&output).contains(&format!(
+        "submitted_observation={submitted_observation_hash}"
+    )));
+    assert_ne!(submitted_observation_hash, expected_hash);
     assert_eq!(proof["program_hash"], expected_hash);
     assert_eq!(
         proof["buckets"]
