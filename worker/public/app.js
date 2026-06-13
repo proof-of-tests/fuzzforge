@@ -499,21 +499,9 @@ function bucketKey(programHash, bucketIndex) {
 
 function formatMetric(value, metric) {
   if (!Number.isFinite(value) || value === 0) {
-    return "0";
+    return "0.00e0";
   }
-  if (metric === "fuel" && value >= 1_000_000_000) {
-    return `${(value / 1_000_000_000).toFixed(2)}B`;
-  }
-  if (value >= 1_000_000) {
-    return `${(value / 1_000_000).toFixed(2)}M`;
-  }
-  if (value >= 10_000) {
-    return `${(value / 1_000).toFixed(1)}K`;
-  }
-  if (value >= 100) {
-    return value.toFixed(0);
-  }
-  return value.toFixed(2);
+  return value.toExponential(2).replace("e+", "e");
 }
 
 function escapeHtml(value) {

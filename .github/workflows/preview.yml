@@ -1,0 +1,273 @@
+name: Website Preview
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - closed
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: website-preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  preview:
+    name: Website preview
+    runs-on: ubuntu-24.04
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Set preview metadata
+        id: preview
+        shell: bash
+        env:
+          CLOUDFLARE_WORKER_NAME: ${{ vars.CLOUDFLARE_WORKER_NAME }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -eu
+          base_worker_name="${CLOUDFLARE_WORKER_NAME:-fuzzforge-api}"
+          echo "worker_name=${base_worker_name}-pr-${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - name: Detect website changes
+        id: changes
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              per_page: 100,
+            });
+
+            const websitePatterns = [
+              /^worker\/public\//,
+              /^worker\/src\//,
+              /^worker\/verifier\//,
+              /^wrangler\.toml$/,
+              /^package\.json$/,
+              /^package-lock\.json$/,
+            ];
+            const websiteFiles = files
+              .map((file) => file.filename)
+              .filter((filename) => websitePatterns.some((pattern) => pattern.test(filename)));
+
+            core.setOutput("website_changed", websiteFiles.length > 0 ? "true" : "false");
+            await core.summary
+              .addHeading("Website preview change detection", 3)
+              .addRaw(
+                websiteFiles.length === 0
+                  ? "No website-serving files changed."
+                  : `Website-serving files changed:\n${websiteFiles.map((file) => `- ${file}`).join("\n")}`,
+              )
+              .write();
+
+      - name: Delete closed PR preview
+        if: github.event.action == 'closed'
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          WORKER_NAME: ${{ steps.preview.outputs.worker_name }}
+        run: |
+          set -eu
+          : "${CLOUDFLARE_API_TOKEN:?CLOUDFLARE_API_TOKEN secret is required}"
+          : "${CLOUDFLARE_ACCOUNT_ID:?CLOUDFLARE_ACCOUNT_ID repository variable is required}"
+
+          status="$(
+            curl -sS -o delete-response.json -w "%{http_code}" \
+              -X DELETE \
+              "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/scripts/${WORKER_NAME}" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json"
+          )"
+          cat delete-response.json
+          if [ "$status" = "200" ] || [ "$status" = "404" ]; then
+            exit 0
+          fi
+          echo "Unexpected Cloudflare API status while deleting ${WORKER_NAME}: ${status}" >&2
+          exit 1
+
+      - name: Update closed PR comment
+        if: github.event.action == 'closed'
+        uses: actions/github-script@v7
+        env:
+          MARKER: "<!-- fuzzforge-preview -->"
+          WORKER_NAME: ${{ steps.preview.outputs.worker_name }}
+        with:
+          script: |
+            const marker = process.env.MARKER;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            const existing = comments.find((comment) => comment.body?.includes(marker));
+            if (!existing) {
+              return;
+            }
+
+            const body = [
+              marker,
+              "### FuzzForge website preview",
+              "",
+              `Preview removed for \`${process.env.WORKER_NAME}\`.`,
+              "",
+              "The temporary deployment was cleaned up because this PR was closed.",
+            ].join("\n");
+
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: existing.id,
+              body,
+            });
+
+      - name: Check out PR
+        if: github.event.action != 'closed' && steps.changes.outputs.website_changed == 'true'
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        if: github.event.action != 'closed' && steps.changes.outputs.website_changed == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust
+        if: github.event.action != 'closed' && steps.changes.outputs.website_changed == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      - name: Validate preview configuration
+        if: github.event.action != 'closed' && steps.changes.outputs.website_changed == 'true'
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_D1_DATABASE_ID: ${{ vars.CLOUDFLARE_D1_DATABASE_ID }}
+        run: |
+          set -eu
+          : "${CLOUDFLARE_API_TOKEN:?CLOUDFLARE_API_TOKEN secret is required}"
+          : "${CLOUDFLARE_ACCOUNT_ID:?CLOUDFLARE_ACCOUNT_ID repository variable is required}"
+          : "${CLOUDFLARE_D1_DATABASE_ID:?CLOUDFLARE_D1_DATABASE_ID repository variable is required}"
+
+      - name: Install dependencies
+        if: github.event.action != 'closed' && steps.changes.outputs.website_changed == 'true'
+        run: npm ci
+
+      - name: Build verifier
+        if: github.event.action != 'closed' && steps.changes.outputs.website_changed == 'true'
+        run: npm run build:verifier
+
+      - name: Build preview config
+        if: github.event.action != 'closed' && steps.changes.outputs.website_changed == 'true'
+        shell: bash
+        env:
+          CLOUDFLARE_D1_DATABASE_ID: ${{ vars.CLOUDFLARE_D1_DATABASE_ID }}
+          CLOUDFLARE_D1_DATABASE_NAME: ${{ vars.CLOUDFLARE_D1_DATABASE_NAME }}
+          CLOUDFLARE_R2_BUCKET_NAME: ${{ vars.CLOUDFLARE_R2_BUCKET_NAME }}
+          WORKER_NAME: ${{ steps.preview.outputs.worker_name }}
+        run: |
+          set -eu
+          : "${CLOUDFLARE_D1_DATABASE_ID:?CLOUDFLARE_D1_DATABASE_ID is required}"
+          CLOUDFLARE_D1_DATABASE_NAME="${CLOUDFLARE_D1_DATABASE_NAME:-fuzzforge}"
+          CLOUDFLARE_R2_BUCKET_NAME="${CLOUDFLARE_R2_BUCKET_NAME:-fuzzforge-wasm}"
+          cat > wrangler.preview.toml <<EOF
+          name = "${WORKER_NAME}"
+          main = "worker/src/index.ts"
+          compatibility_date = "2025-09-06"
+          workers_dev = true
+
+          [assets]
+          directory = "worker/public"
+          binding = "ASSETS"
+          run_worker_first = true
+
+          [[d1_databases]]
+          binding = "DB"
+          database_name = "${CLOUDFLARE_D1_DATABASE_NAME}"
+          database_id = "${CLOUDFLARE_D1_DATABASE_ID}"
+          migrations_dir = "worker/migrations"
+
+          [[r2_buckets]]
+          binding = "WASM_BUCKET"
+          bucket_name = "${CLOUDFLARE_R2_BUCKET_NAME}"
+
+          [[rules]]
+          type = "CompiledWasm"
+          globs = ["**/*.wasm"]
+          EOF
+
+      - name: Deploy preview
+        id: deploy
+        if: github.event.action != 'closed' && steps.changes.outputs.website_changed == 'true'
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          npx wrangler deploy --config wrangler.preview.toml 2>&1 | tee wrangler-preview.log
+          preview_url="$(sed -nE 's#.*(https://[^[:space:]]+\.workers\.dev).*#\1#p' wrangler-preview.log | tail -n 1)"
+          if [ -z "$preview_url" ]; then
+            echo "Could not find a workers.dev URL in Wrangler output." >&2
+            exit 1
+          fi
+          echo "url=${preview_url}" >> "$GITHUB_OUTPUT"
+
+      - name: Update preview comment
+        if: github.event.action != 'closed' && steps.changes.outputs.website_changed == 'true'
+        uses: actions/github-script@v7
+        env:
+          MARKER: "<!-- fuzzforge-preview -->"
+          PREVIEW_URL: ${{ steps.deploy.outputs.url }}
+          WORKER_NAME: ${{ steps.preview.outputs.worker_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        with:
+          script: |
+            const marker = process.env.MARKER;
+            const shortSha = process.env.HEAD_SHA.slice(0, 7);
+            const body = [
+              marker,
+              "### FuzzForge website preview",
+              "",
+              `Temporary deployment: [${process.env.PREVIEW_URL}](${process.env.PREVIEW_URL})`,
+              "",
+              `Worker: \`${process.env.WORKER_NAME}\``,
+              `Commit: \`${shortSha}\``,
+              "",
+              "This preview uses the production D1 database and production R2 bucket.",
+            ].join("\n");
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            const existing = comments.find((comment) => comment.body?.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+              return;
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
