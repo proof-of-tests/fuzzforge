@@ -41,6 +41,11 @@ interface ProgramRow {
   updated_at: string;
 }
 
+interface ProgramListResponse {
+  programs: ProgramRow[];
+  next_cursor: string | null;
+}
+
 interface GitHubUser {
   login?: unknown;
 }
@@ -102,6 +107,12 @@ export default {
 
       if (request.method === "GET" && url.pathname === "/api/auth/github") {
         return json({ client_id: env.GITHUB_APP_CLIENT_ID ?? null });
+      }
+
+      if (parts[0] === "api" && parts[1] === "programs" && parts.length === 2) {
+        if (request.method === "GET") {
+          return await listPrograms(url, env);
+        }
       }
 
       if (parts[0] === "api" && parts[1] === "programs" && parts.length === 3) {
@@ -262,6 +273,53 @@ async function getProgram(env: Env, programHash: string): Promise<Response> {
     throw new HttpError(404, "program_not_found");
   }
   return json(row);
+}
+
+async function listPrograms(url: URL, env: Env): Promise<Response> {
+  const limit = Math.min(parseNonNegativeInt(url.searchParams.get("limit"), 100), 1000);
+  const associatedOnly = url.searchParams.get("associated") === "true";
+  const cursor = url.searchParams.get("cursor");
+  if (cursor !== null) {
+    normalizeProgramHash(cursor);
+  }
+
+  const where: string[] = [];
+  const binds: string[] = [];
+  if (associatedOnly) {
+    where.push("github_repository IS NOT NULL");
+  }
+  if (cursor !== null) {
+    where.push("program_hash > ?");
+    binds.push(cursor.toLowerCase());
+  }
+
+  const whereSql = where.length === 0 ? "" : `WHERE ${where.join(" AND ")}`;
+  const result = await env.DB.prepare(
+    `SELECT
+      program_hash,
+      github_repository,
+      component_name,
+      version,
+      github_verified_by,
+      github_verified_at,
+      wasm_bytes,
+      created_at,
+      updated_at
+     FROM programs
+     ${whereSql}
+     ORDER BY program_hash ASC
+     LIMIT ?`,
+  )
+    .bind(...binds, limit + 1)
+    .all<ProgramRow>();
+
+  const programs = result.results.slice(0, limit);
+  const response: ProgramListResponse = {
+    programs,
+    next_cursor:
+      result.results.length > limit ? programs[programs.length - 1]?.program_hash ?? null : null,
+  };
+  return json(response);
 }
 
 async function putProof(request: Request, env: Env, programHash: string): Promise<Response> {

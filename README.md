@@ -16,6 +16,7 @@ cargo run -- list
 cargo run -- auth login
 cargo run -- run ./test.wasm --count=100 --submit-url
 cargo run -- submit ./test.wasm
+cargo run -- corpus
 cargo run -- rate
 ```
 
@@ -39,6 +40,14 @@ for network commands, fuzzforge reads `FUZZFORGE_API_URL` and otherwise defaults
 to `https://fuzzforge.lemmih.com`. Submitted proofs must use the current
 verifier version settings. Version 1 uses the default `fuel`, `memory_bytes`,
 and `_start` invocation.
+
+Use `fuzzforge corpus` to continuously fetch repository-associated WASM modules
+from the API, download each module, spend `10_000_000_000` guest fuel on each
+program using generated seeds, submit the resulting proof, and then start the
+corpus again. The command only runs modules whose metadata reports a
+`github_repository`, so uploads require `fuzzforge auth login`. Use `--cycles
+<n>` for a finite number of corpus passes, or `--fuel-budget <fuel>` to override
+the per-program fuel budget.
 
 WASM modules can optionally report FuzzForge metadata by handling a `--metadata`
 argument. When run with that argument, the module should print a JSON object to
@@ -126,6 +135,7 @@ an external HyperLogLog package.
 The Worker API lives in `worker/src/index.ts` and uses:
 
 - R2 for `PUT/GET /api/programs/:program_hash/wasm`
+- D1 for `GET /api/programs?associated=true` associated program discovery
 - D1 for `GET /api/programs/:program_hash` metadata
 - D1 for `POST/GET /api/programs/:program_hash/proof`
 - GitHub App user tokens for associated WASM upload authorization

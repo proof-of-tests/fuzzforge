@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 const DEFAULT_RUN_COUNT: usize = 1;
 const DEFAULT_SUBMIT_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_RATE_WINDOW_SECONDS: u64 = 10;
+const DEFAULT_CORPUS_FUEL_BUDGET: u64 = 10_000_000_000;
+const PROGRAM_LIST_PAGE_SIZE: usize = 100;
 const API_URL_ENV: &str = "FUZZFORGE_API_URL";
 const DEFAULT_API_URL: &str = "https://fuzzforge.lemmih.com";
 
@@ -131,6 +133,41 @@ enum Command {
         /// HTTP timeout for proof submission.
         #[arg(long, default_value_t = DEFAULT_SUBMIT_TIMEOUT_SECONDS)]
         timeout_seconds: u64,
+    },
+
+    /// Continuously run every repository-associated WASM program from a fuzzforge API.
+    Corpus {
+        /// FuzzForge API base URL. Defaults to FUZZFORGE_API_URL or the public FuzzForge API.
+        #[arg(long)]
+        api_url: Option<String>,
+
+        /// Store directory for downloaded WASM modules and HLL data.
+        #[arg(long, default_value = ".fuzzforge")]
+        store: PathBuf,
+
+        /// Guest fuel to spend on each program before moving to the next one.
+        #[arg(long, default_value_t = DEFAULT_CORPUS_FUEL_BUDGET)]
+        fuel_budget: u64,
+
+        /// Number of random seed bytes to generate for each run.
+        #[arg(long, default_value_t = DEFAULT_SEED_BYTES)]
+        seed_bytes: usize,
+
+        /// Persist HLL progress after this much guest fuel is consumed.
+        #[arg(long, default_value_t = DEFAULT_SAVE_FUEL_INTERVAL)]
+        save_fuel_interval: u64,
+
+        /// HTTP timeout for program downloads and proof submissions.
+        #[arg(long, default_value_t = DEFAULT_SUBMIT_TIMEOUT_SECONDS)]
+        timeout_seconds: u64,
+
+        /// Limit the number of full corpus cycles. Omit to run forever.
+        #[arg(long)]
+        cycles: Option<usize>,
+
+        /// Seconds to sleep between corpus cycles.
+        #[arg(long, default_value_t = 0)]
+        cycle_sleep_seconds: u64,
     },
 
     /// Watch the live test execution rate from a fuzzforge API.
@@ -321,6 +358,40 @@ fn main() -> Result<()> {
                 Duration::from_secs(timeout_seconds),
             )?;
         }
+        Command::Corpus {
+            api_url,
+            store,
+            fuel_budget,
+            seed_bytes,
+            save_fuel_interval,
+            timeout_seconds,
+            cycles,
+            cycle_sleep_seconds,
+        } => {
+            if fuel_budget == 0 {
+                anyhow::bail!("--fuel-budget must be greater than zero");
+            }
+            if save_fuel_interval == 0 {
+                anyhow::bail!("--save-fuel-interval must be greater than zero");
+            }
+            if timeout_seconds == 0 {
+                anyhow::bail!("--timeout-seconds must be greater than zero");
+            }
+            if cycles == Some(0) {
+                anyhow::bail!("--cycles must be greater than zero");
+            }
+            let api_url = api_url_or_env(api_url)?;
+            run_corpus(
+                &api_url,
+                &store,
+                fuel_budget,
+                seed_bytes,
+                save_fuel_interval,
+                Duration::from_secs(timeout_seconds),
+                cycles,
+                Duration::from_secs(cycle_sleep_seconds),
+            )?;
+        }
         Command::Rate {
             api_url,
             window_seconds,
@@ -332,6 +403,182 @@ fn main() -> Result<()> {
             watch_rate(&api_url, Duration::from_secs(window_seconds))?;
         }
     }
+    Ok(())
+}
+
+fn run_corpus(
+    api_url: &str,
+    store: &PathBuf,
+    fuel_budget: u64,
+    seed_bytes: usize,
+    save_fuel_interval: u64,
+    timeout: Duration,
+    cycles: Option<usize>,
+    cycle_sleep: Duration,
+) -> Result<()> {
+    let client = Client::builder()
+        .timeout(timeout)
+        .build()
+        .context("failed to build HTTP client")?;
+    let mut completed_cycles = 0usize;
+    loop {
+        let programs = list_associated_programs(&client, api_url)?;
+        eprintln!(
+            "corpus_cycle={} associated_programs={}",
+            completed_cycles + 1,
+            programs.len()
+        );
+        let mut downloads = Vec::with_capacity(programs.len());
+        for program in programs {
+            match download_associated_program(&client, api_url, store, program) {
+                Ok(Some(download)) => downloads.push(download),
+                Ok(None) => {}
+                Err(error) => eprintln!("download_error={error:#}"),
+            }
+        }
+
+        for download in downloads {
+            run_corpus_program(
+                api_url,
+                store,
+                &download,
+                fuel_budget,
+                seed_bytes,
+                save_fuel_interval,
+                timeout,
+            )
+            .with_context(|| format!("failed to run {}", download.program.program_hash))?;
+        }
+
+        completed_cycles = completed_cycles.saturating_add(1);
+        if cycles.is_some_and(|max_cycles| completed_cycles >= max_cycles) {
+            return Ok(());
+        }
+        if !cycle_sleep.is_zero() {
+            thread::sleep(cycle_sleep);
+        }
+    }
+}
+
+fn list_associated_programs(client: &Client, api_url: &str) -> Result<Vec<ProgramSummary>> {
+    let base = api_url.trim_end_matches('/');
+    let mut cursor: Option<String> = None;
+    let mut programs = Vec::new();
+    loop {
+        let mut url = format!(
+            "{base}/api/programs?associated=true&limit={}",
+            PROGRAM_LIST_PAGE_SIZE
+        );
+        if let Some(cursor) = &cursor {
+            url.push_str("&cursor=");
+            url.push_str(cursor);
+        }
+        let response = client
+            .get(&url)
+            .send()
+            .with_context(|| format!("failed to list programs from {url}"))?;
+        ensure_success_ref(&response, "program listing")?;
+        let page: ProgramListResponse = response.json().context("failed to parse program list")?;
+        programs.extend(page.programs);
+        match page.next_cursor {
+            Some(next_cursor) => cursor = Some(next_cursor),
+            None => return Ok(programs),
+        }
+    }
+}
+
+fn download_associated_program(
+    client: &Client,
+    api_url: &str,
+    store: &PathBuf,
+    program: ProgramSummary,
+) -> Result<Option<CorpusDownload>> {
+    let base = api_url.trim_end_matches('/');
+    let wasm_url = format!("{base}/api/programs/{}/wasm", program.program_hash);
+    let response = client
+        .get(&wasm_url)
+        .send()
+        .with_context(|| format!("failed to download WASM from {wasm_url}"))?;
+    ensure_success_ref(&response, "WASM download")?;
+    let wasm = response.bytes().context("failed to read WASM download")?;
+    let metadata =
+        query_wasm_metadata(&wasm).context("failed to query downloaded WASM metadata")?;
+    if metadata
+        .and_then(|metadata| metadata.github_repository)
+        .is_none()
+    {
+        eprintln!("skipped_unassociated={}", program.program_hash);
+        return Ok(None);
+    }
+
+    let wasm_dir = store.join("wasm");
+    fs::create_dir_all(&wasm_dir)
+        .with_context(|| format!("failed to create {}", wasm_dir.display()))?;
+    let wasm_path = wasm_dir.join(format!("{}.wasm", program.program_hash));
+    let tmp = wasm_path.with_extension(format!("wasm.tmp.{}", std::process::id()));
+    fs::write(&tmp, &wasm).with_context(|| format!("failed to write {}", tmp.display()))?;
+    fs::rename(&tmp, &wasm_path).with_context(|| {
+        format!(
+            "failed to rename {} to {}",
+            tmp.display(),
+            wasm_path.display()
+        )
+    })?;
+
+    let actual_hash = hash_wasm_file(&wasm_path)
+        .with_context(|| format!("failed to hash {}", wasm_path.display()))?;
+    if actual_hash != program.program_hash {
+        anyhow::bail!(
+            "downloaded WASM hash mismatch: expected {}, got {}",
+            program.program_hash,
+            actual_hash
+        );
+    }
+
+    Ok(Some(CorpusDownload { program, wasm_path }))
+}
+
+fn run_corpus_program(
+    api_url: &str,
+    store: &PathBuf,
+    download: &CorpusDownload,
+    fuel_budget: u64,
+    seed_bytes: usize,
+    save_fuel_interval: u64,
+    timeout: Duration,
+) -> Result<()> {
+    let mut session = RunSession::from_wasm_path(&download.wasm_path, store, RunConfig::default())
+        .with_context(|| format!("failed to prepare {}", download.wasm_path.display()))?;
+    let mut fuel_spent = 0u64;
+    eprintln!(
+        "program_start={} repository={} fuel_budget={}",
+        download.program.program_hash,
+        download.program.github_repository.as_deref().unwrap_or("-"),
+        fuel_budget
+    );
+    while fuel_spent < fuel_budget {
+        let result = session
+            .run(generate_seed(seed_bytes)?)
+            .with_context(|| format!("failed to run {}", download.wasm_path.display()))?;
+        fuel_spent = fuel_spent.saturating_add(result.fuel_consumed);
+        session
+            .save_after_fuel(save_fuel_interval)
+            .with_context(|| format!("failed to save HLL record for {}", session.program_hash()))?;
+        if result.fuel_consumed == 0 {
+            eprintln!("program_zero_fuel={}", session.program_hash());
+            break;
+        }
+    }
+    session
+        .save_pending()
+        .with_context(|| format!("failed to save HLL record for {}", session.program_hash()))?;
+    submit_proof(api_url, &download.wasm_path, session.record(), timeout)?;
+    eprintln!(
+        "program_done={} fuel_spent={} estimated_observations={:.3}",
+        session.program_hash(),
+        fuel_spent,
+        session.stats().estimated_observations
+    );
     Ok(())
 }
 
@@ -586,6 +833,23 @@ struct GitHubTokenResponse {
 struct StoredGitHubToken {
     access_token: String,
     expires_at: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProgramListResponse {
+    programs: Vec<ProgramSummary>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProgramSummary {
+    program_hash: String,
+    github_repository: Option<String>,
+}
+
+struct CorpusDownload {
+    program: ProgramSummary,
+    wasm_path: PathBuf,
 }
 
 fn watch_rate(api_url: &str, window: Duration) -> Result<()> {

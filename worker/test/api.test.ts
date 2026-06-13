@@ -209,6 +209,41 @@ describe("fuzzforge worker api", () => {
     });
   });
 
+  test("lists stored programs and filters to associated programs", async () => {
+    await uploadWasm();
+    mockGitHubRepositoryPermissions({ pull: true, push: true, admin: false });
+    const associatedPut = await SELF.fetch(
+      `https://example.com/api/programs/${ASSOCIATED_PROGRAM_HASH}/wasm`,
+      {
+        method: "PUT",
+        headers: { authorization: "Bearer write-token" },
+        body: ASSOCIATED_WASM,
+      },
+    );
+    expect(associatedPut.status, await associatedPut.clone().text()).toBe(200);
+
+    const firstPage = await SELF.fetch("https://example.com/api/programs?limit=1");
+    expect(firstPage.status).toBe(200);
+    await expect(firstPage.json()).resolves.toMatchObject({
+      programs: [{ program_hash: PROGRAM_HASH, github_repository: null }],
+      next_cursor: PROGRAM_HASH,
+    });
+
+    const associated = await SELF.fetch("https://example.com/api/programs?associated=true");
+    expect(associated.status).toBe(200);
+    await expect(associated.json()).resolves.toMatchObject({
+      programs: [
+        {
+          program_hash: ASSOCIATED_PROGRAM_HASH,
+          github_repository: "owner/repo",
+          component_name: "api",
+          version: "1.2.3",
+        },
+      ],
+      next_cursor: null,
+    });
+  });
+
   test("allows authorization header in cors preflight", async () => {
     const response = await SELF.fetch("https://example.com/api/programs", {
       method: "OPTIONS",

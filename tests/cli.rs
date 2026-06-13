@@ -539,6 +539,115 @@ fn associated_submit_without_token_fails_before_upload() {
     assert!(stderr(&submit).contains("fuzzforge auth login"));
 }
 
+#[test]
+fn corpus_downloads_associated_programs_runs_and_submits() {
+    let _guard = HTTP_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let temp = tempdir().expect("tempdir");
+    let store_path = temp.path().join("store");
+    let config_path = temp.path().join("config");
+    let wasm = associated_echo_wasm();
+    let expected_hash = blake3::hash(&wasm).to_hex().to_string();
+    let token_dir = config_path.join("fuzzforge");
+    fs::create_dir_all(&token_dir).expect("create token dir");
+    fs::write(
+        token_dir.join("github.json"),
+        br#"{"access_token":"test-token","expires_at":4102444800}"#,
+    )
+    .expect("write token");
+
+    let (server, api_url) = test_server();
+    let (tx, rx) = mpsc::channel();
+    let server_thread = thread::spawn({
+        let expected_hash = expected_hash.clone();
+        let wasm = wasm.clone();
+        move || {
+            for _ in 0..4 {
+                let mut request = server.recv().expect("request");
+                let mut body = Vec::new();
+                std::io::Read::read_to_end(request.as_reader(), &mut body).expect("body");
+                let method = request.method().as_str().to_owned();
+                let url = request.url().to_owned();
+                let authorization = request
+                    .headers()
+                    .iter()
+                    .find(|header| header.field.equiv("authorization"))
+                    .map(|header| header.value.as_str().to_owned());
+                tx.send((method.clone(), url.clone(), authorization, body))
+                    .expect("send request");
+
+                let response = match (method.as_str(), url.as_str()) {
+                    ("GET", "/api/programs?associated=true&limit=100") => {
+                        tiny_http::Response::from_string(format!(
+                            r#"{{"programs":[{{"program_hash":"{expected_hash}","github_repository":"owner/repo"}}],"next_cursor":null}}"#
+                        ))
+                        .with_header(
+                            tiny_http::Header::from_bytes(
+                                b"content-type".as_slice(),
+                                b"application/json".as_slice(),
+                            )
+                            .unwrap(),
+                        )
+                    }
+                    ("GET", path) if path == format!("/api/programs/{expected_hash}/wasm") => {
+                        tiny_http::Response::from_data(wasm.clone()).with_header(
+                            tiny_http::Header::from_bytes(
+                                b"content-type".as_slice(),
+                                b"application/wasm".as_slice(),
+                            )
+                            .unwrap(),
+                        )
+                    }
+                    _ => tiny_http::Response::from_string("{}").with_header(
+                        tiny_http::Header::from_bytes(
+                            b"content-type".as_slice(),
+                            b"application/json".as_slice(),
+                        )
+                        .unwrap(),
+                    ),
+                };
+                request.respond(response).expect("respond");
+            }
+        }
+    });
+
+    let corpus = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
+        .env("XDG_CONFIG_HOME", &config_path)
+        .args([
+            "corpus",
+            "--api-url",
+            &api_url,
+            "--store",
+            store_path.to_str().unwrap(),
+            "--fuel-budget=1",
+            "--cycles=1",
+        ])
+        .output()
+        .expect("corpus command");
+    assert!(corpus.status.success(), "stderr: {}", stderr(&corpus));
+    assert!(stdout(&corpus).contains(&format!("submitted_proof={expected_hash}")));
+
+    let requests: Vec<_> = (0..4).map(|_| rx.recv().expect("request")).collect();
+    server_thread.join().expect("server thread");
+    assert_eq!(requests[0].0, "GET");
+    assert_eq!(requests[0].1, "/api/programs?associated=true&limit=100");
+    assert_eq!(requests[1].0, "GET");
+    assert_eq!(requests[1].1, format!("/api/programs/{expected_hash}/wasm"));
+    assert_eq!(requests[2].0, "PUT");
+    assert_eq!(requests[2].1, format!("/api/programs/{expected_hash}/wasm"));
+    assert_eq!(requests[2].2, Some("Bearer test-token".to_owned()));
+    assert_eq!(requests[2].3, wasm);
+    assert_eq!(requests[3].0, "POST");
+    assert_eq!(
+        requests[3].1,
+        format!("/api/programs/{expected_hash}/proof")
+    );
+    let proof: serde_json::Value = serde_json::from_slice(&requests[3].3).expect("proof json");
+    assert_eq!(proof["program_hash"], expected_hash);
+    assert_eq!(proof["observations"].as_array().unwrap().len(), 1);
+}
+
 fn test_server() -> (tiny_http::Server, String) {
     for _ in 0..100 {
         let port = NEXT_TEST_PORT.fetch_add(1, Ordering::Relaxed);
