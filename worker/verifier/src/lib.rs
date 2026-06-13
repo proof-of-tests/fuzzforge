@@ -90,12 +90,6 @@ struct ExecutionOutput {
     stdout: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct VerificationReport {
-    fuel_consumed: u64,
-    invocations: u64,
-}
-
 #[derive(Debug)]
 struct HostState {
     args: Vec<Vec<u8>>,
@@ -199,16 +193,15 @@ pub unsafe extern "C" fn ff_verify(
     out_ptr: *mut u8,
     out_len: usize,
 ) -> i32 {
-    if wasm_ptr.is_null() || record_ptr.is_null() || out_ptr.is_null() || out_len < 16 {
+    if wasm_ptr.is_null() || record_ptr.is_null() || out_ptr.is_null() || out_len < 8 {
         return VERIFY_INVALID_INPUT;
     }
     let wasm = unsafe { slice::from_raw_parts(wasm_ptr, wasm_len) };
     let record_json = unsafe { slice::from_raw_parts(record_ptr, record_len) };
     let out = unsafe { slice::from_raw_parts_mut(out_ptr, out_len) };
     match verify(wasm, record_json) {
-        Ok(report) => {
-            out[..8].copy_from_slice(&report.fuel_consumed.to_le_bytes());
-            out[8..16].copy_from_slice(&report.invocations.to_le_bytes());
+        Ok(fuel_consumed) => {
+            out[..8].copy_from_slice(&fuel_consumed.to_le_bytes());
             VERIFY_OK
         }
         Err(code) => code,
@@ -226,7 +219,7 @@ fn estimate_fuel(wasm: &[u8]) -> Result<u64, i32> {
     Ok(output.fuel_consumed)
 }
 
-fn verify(wasm: &[u8], record_json: &[u8]) -> Result<VerificationReport, i32> {
+fn verify(wasm: &[u8], record_json: &[u8]) -> Result<u64, i32> {
     let record: HllRecord =
         serde_json::from_slice(record_json).map_err(|_| VERIFY_INVALID_RECORD)?;
     if record.schema_version != 2
@@ -242,22 +235,20 @@ fn verify(wasm: &[u8], record_json: &[u8]) -> Result<VerificationReport, i32> {
         return Err(VERIFY_WASM_MISMATCH);
     }
 
-    let mut report = VerificationReport {
-        fuel_consumed: 0,
-        invocations: 0,
-    };
+    let mut verified_fuel = None;
     for (bucket, expected) in record.buckets.iter().enumerate() {
         let Some(expected) = expected else {
             continue;
         };
+        if verified_fuel.is_some() {
+            return Err(VERIFY_INVALID_RECORD);
+        }
         if observation_bucket(&expected.observation_hash)? != bucket {
             return Err(VERIFY_INVALID_RECORD);
         }
-        let fuel_consumed = verify_observation(&program, &record.program_hash, expected)?;
-        report.fuel_consumed = report.fuel_consumed.saturating_add(fuel_consumed);
-        report.invocations = report.invocations.saturating_add(1);
+        verified_fuel = Some(verify_observation(&program, &record.program_hash, expected)?);
     }
-    Ok(report)
+    verified_fuel.ok_or(VERIFY_INVALID_RECORD)
 }
 
 fn query_metadata(wasm: &[u8]) -> Result<Option<String>, i32> {

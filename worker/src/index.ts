@@ -66,7 +66,6 @@ interface WasmMetadata {
 
 interface ProofVerificationReport {
   fuel_consumed: number;
-  invocations: number;
 }
 
 const HASH_RE = /^[0-9a-f]{64}$/;
@@ -414,7 +413,7 @@ async function putProof(request: Request, env: Env, programHash: string): Promis
     program_hash: programHash,
     bucket_witnesses: bucketWitnesses,
     estimated_observations: estimate(bucketsToRegisters(proof.buckets)),
-    verified_observations: verification.invocations,
+    verified_observations: 1,
   });
 }
 
@@ -428,15 +427,13 @@ function fuelEstimateUpdateStatement(
      SET
       average_fuel_consumed =
         ((COALESCE(average_fuel_consumed, 0) * fuel_samples) + ?) /
-        (fuel_samples + ?),
-      fuel_samples = fuel_samples + ?,
+        (fuel_samples + 1),
+      fuel_samples = fuel_samples + 1,
       updated_at = ?
      WHERE program_hash = ?`,
   )
     .bind(
       verification.fuel_consumed,
-      verification.invocations,
-      verification.invocations,
       new Date().toISOString(),
       programHash,
     );
@@ -529,11 +526,13 @@ function validateHllRecord(value: unknown, programHash: string): HllRecord {
   if (!Array.isArray(record.buckets) || record.buckets.length !== HLL_BUCKETS) {
     throw new HttpError(400, "invalid_hll_buckets");
   }
+  let observations = 0;
   for (let index = 0; index < record.buckets.length; index += 1) {
     const observation = record.buckets[index];
     if (observation === null) {
       continue;
     }
+    observations += 1;
     if (!isRecord(observation)) {
       throw new HttpError(400, "invalid_hll_bucket");
     }
@@ -549,6 +548,9 @@ function validateHllRecord(value: unknown, programHash: string): HllRecord {
     if (observationBucket(observation.observation_hash).index !== index) {
       throw new HttpError(400, "invalid_hll_bucket");
     }
+  }
+  if (observations !== 1) {
+    throw new HttpError(400, "invalid_hll_buckets");
   }
   return record as HllRecord;
 }
@@ -754,7 +756,7 @@ async function verifyProof(
   const recordBytes = new TextEncoder().encode(JSON.stringify(record));
   const wasmPtr = copyIntoVerifier(exports, wasmBytes);
   const recordPtr = copyIntoVerifier(exports, recordBytes);
-  const outLen = 16;
+  const outLen = 8;
   const outPtr = exports.ff_alloc(outLen);
   try {
     const code = exports.ff_verify(
@@ -770,16 +772,11 @@ async function verifyProof(
     }
     const view = new DataView(exports.memory.buffer, outPtr, outLen);
     const fuelConsumed = view.getBigUint64(0, true);
-    const invocations = view.getBigUint64(8, true);
-    if (
-      fuelConsumed > BigInt(Number.MAX_SAFE_INTEGER) ||
-      invocations > BigInt(Number.MAX_SAFE_INTEGER)
-    ) {
+    if (fuelConsumed > BigInt(Number.MAX_SAFE_INTEGER)) {
       throw new HttpError(400, "proof_fuel_too_large");
     }
     return {
       fuel_consumed: Number(fuelConsumed),
-      invocations: Number(invocations),
     };
   } finally {
     exports.ff_dealloc(wasmPtr, wasmBytes.byteLength);

@@ -239,7 +239,7 @@ describe("fuzzforge worker api", () => {
     });
   });
 
-  test("updates fuel estimates from submitted proof invocations", async () => {
+  test("updates fuel estimates from a submitted proof observation", async () => {
     await uploadWasm();
     await env.DB.prepare(
       "UPDATE programs SET average_fuel_consumed = ?, fuel_samples = ? WHERE program_hash = ?",
@@ -258,6 +258,14 @@ describe("fuzzforge worker api", () => {
     expect(row?.fuel_samples).toBe(3);
     expect(row?.average_fuel_consumed).toBeGreaterThan(0);
     expect(row?.average_fuel_consumed).toBeLessThan(1_000_000_000);
+  });
+
+  test("rejects proof submissions with multiple observations", async () => {
+    await uploadWasm();
+
+    const response = await submitProof(proofRecord(OBSERVATIONS));
+    expect(response.status, await response.clone().text()).toBe(400);
+    await expect(response.json()).resolves.toEqual({ error: "invalid_hll_buckets" });
   });
 
   test("lists stored programs and filters to associated programs", async () => {
