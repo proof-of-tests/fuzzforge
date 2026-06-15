@@ -160,7 +160,7 @@ function totalsByProgram() {
   for (const bucket of state.buckets.values()) {
     let registers = registersByProgram.get(bucket.program_hash);
     if (!registers) {
-      registers = Array.from({ length: HLL_BUCKETS }, () => 0);
+      registers = Array.from({ length: HLL_BUCKETS }, () => null);
       registersByProgram.set(bucket.program_hash, registers);
     }
     registers[bucket.bucket_index] = observationRank(bucket.observation_hash);
@@ -466,14 +466,17 @@ function observationRank(observationHash) {
   if (remaining === 0n) {
     return maxRank;
   }
-  return Math.min(64 - remaining.toString(2).length + 1, maxRank);
+  return Math.min(Math.max(64 - Math.log2(Number(remaining)), 0), maxRank);
 }
 
 function estimate(registers) {
   const m = HLL_BUCKETS;
-  const sum = registers.reduce((total, rank) => total + 2 ** -rank, 0);
+  const sum = registers.reduce(
+    (total, rank) => total + (rank === null ? 1 : 2 ** -rank),
+    0,
+  );
   const raw = alpha(m) * m * m / sum;
-  const zeros = registers.filter((rank) => rank === 0).length;
+  const zeros = registers.filter((rank) => rank === null).length;
   if (raw <= 2.5 * m && zeros > 0) {
     return m * Math.log(m / zeros);
   }

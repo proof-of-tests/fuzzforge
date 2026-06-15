@@ -365,6 +365,44 @@ describe("fuzzforge worker api", () => {
     expect(body.bucket_witnesses).toHaveLength(2);
   });
 
+  test("fractional hll estimate improves for smaller same-rank bucket witnesses", async () => {
+    const programHash = "b".repeat(64);
+    const baseRemaining = 3n << 56n;
+    const lowerSameIntegerRank = (1n << 57n) + 1n;
+    await env.DB.batch(
+      Array.from({ length: 64 }, (_, bucket) =>
+        env.DB.prepare(
+          `INSERT INTO hll_buckets
+           (program_hash, bucket_index, verifier_version, observation_hash, seed_hex)
+           VALUES (?, ?, ?, ?, ?)`,
+        ).bind(
+          programHash,
+          bucket,
+          1,
+          observationHashForBucket(bucket, baseRemaining),
+          bucket.toString(16).padStart(2, "0"),
+        ),
+      ),
+    );
+
+    const before = (await (
+      await SELF.fetch("https://example.com/api/hash-results")
+    ).json()) as { total_tests: number };
+
+    await env.DB.prepare(
+      `UPDATE hll_buckets
+       SET observation_hash = ?, seed_hex = ?
+       WHERE program_hash = ? AND bucket_index = ?`,
+    )
+      .bind(observationHashForBucket(17, lowerSameIntegerRank), "ff", programHash, 17)
+      .run();
+
+    const after = (await (
+      await SELF.fetch("https://example.com/api/hash-results")
+    ).json()) as { total_tests: number };
+    expect(after.total_tests).toBeGreaterThan(before.total_tests);
+  });
+
   test("preserves concurrent writes to different hll buckets", async () => {
     await uploadWasm();
 
@@ -570,6 +608,11 @@ function proofObservation(observation: { seed_hex: string; observation_hash: str
 function observationBucket(observationHash: string): number {
   const value = BigInt(`0x${observationHash.slice(0, 16)}`);
   return Number(value >> 58n);
+}
+
+function observationHashForBucket(bucket: number, remaining: bigint): string {
+  const prefix = (BigInt(bucket) << 58n) | remaining;
+  return `${prefix.toString(16).padStart(16, "0")}${"0".repeat(48)}`;
 }
 
 function parseSseData(text: string): unknown {

@@ -276,27 +276,23 @@ impl StoredObservation {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Sketch {
-    registers: Vec<u8>,
+    registers: Vec<Option<f64>>,
 }
 
 impl Sketch {
     pub fn new() -> Self {
         Self {
-            registers: vec![0; HLL_BUCKETS],
+            registers: vec![None; HLL_BUCKETS],
         }
     }
 
     pub fn insert_hash(&mut self, hash: u64) {
         debug_assert_eq!(self.registers.len(), HLL_BUCKETS);
-        let bucket = (hash >> (u64::BITS - u32::from(HLL_PRECISION))) as usize;
-        let remaining = hash << HLL_PRECISION;
-        let max_rank = u64::BITS - u32::from(HLL_PRECISION) + 1;
-        let rank = if remaining == 0 {
-            max_rank
-        } else {
-            (remaining.leading_zeros() + 1).min(max_rank)
-        } as u8;
-        self.registers[bucket] = self.registers[bucket].max(rank);
+        let bucket = hll_bucket_index(hash);
+        let rank = hll_fractional_rank(hash);
+        if self.registers[bucket].is_none_or(|previous| rank > previous) {
+            self.registers[bucket] = Some(rank);
+        }
     }
 
     pub fn estimate(&self) -> f64 {
@@ -304,10 +300,10 @@ impl Sketch {
         let sum: f64 = self
             .registers
             .iter()
-            .map(|rank| 2.0_f64.powi(-i32::from(*rank)))
+            .map(|rank| rank.map_or(1.0, |rank| 2.0_f64.powf(-rank)))
             .sum();
         let raw = alpha(HLL_BUCKETS) * m * m / sum;
-        let zeros = self.registers.iter().filter(|rank| **rank == 0).count();
+        let zeros = self.registers.iter().filter(|rank| rank.is_none()).count();
         if raw <= 2.5 * m && zeros > 0 {
             m * (m / zeros as f64).ln()
         } else {
@@ -1243,6 +1239,16 @@ fn hll_bucket_index(hash_prefix: u64) -> usize {
     (hash_prefix >> (u64::BITS - u32::from(HLL_PRECISION))) as usize
 }
 
+fn hll_fractional_rank(hash_prefix: u64) -> f64 {
+    let remaining = hash_prefix << HLL_PRECISION;
+    let max_rank = f64::from(u64::BITS - u32::from(HLL_PRECISION) + 1);
+    if remaining == 0 {
+        max_rank
+    } else {
+        (f64::from(u64::BITS) - (remaining as f64).log2()).min(max_rank)
+    }
+}
+
 fn bytes_to_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -1447,6 +1453,30 @@ mod tests {
         let second = record.stats().estimated_observations;
         assert_eq!(record.bucket_witnesses().count(), 1);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn smaller_same_rank_hash_increases_fractional_hll_estimate() {
+        let base_remaining = 3u64 << (64 - HLL_PRECISION - 2);
+        let lower_same_integer_rank = (1u64 << (64 - HLL_PRECISION - 1)) + 1;
+        let mut base = Sketch::new();
+        let mut improved = Sketch::new();
+        for bucket in 0..HLL_BUCKETS {
+            let hash = ((bucket as u64) << (64 - HLL_PRECISION)) | base_remaining;
+            base.insert_hash(hash);
+            improved.insert_hash(hash);
+        }
+
+        let original_hash = (17u64 << (64 - HLL_PRECISION)) | base_remaining;
+        let improved_hash = (17u64 << (64 - HLL_PRECISION)) | lower_same_integer_rank;
+        assert_eq!(hll_bucket_index(improved_hash), 17);
+        assert_eq!(
+            (improved_hash << HLL_PRECISION).leading_zeros(),
+            (original_hash << HLL_PRECISION).leading_zeros()
+        );
+        improved.insert_hash(improved_hash);
+
+        assert!(improved.estimate() > base.estimate());
     }
 
     #[test]

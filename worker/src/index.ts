@@ -985,23 +985,26 @@ function observationBucket(observationHash: string): { index: number; rank: numb
   const rank =
     remaining === 0n
       ? maxRank
-      : Math.min(64 - remaining.toString(2).length + 1, maxRank);
+      : Math.min(Math.max(64 - Math.log2(Number(remaining)), 0), maxRank);
   return { index, rank };
 }
 
-function estimate(registers: number[]): number {
+function estimate(registers: Array<number | null>): number {
   const m = HLL_BUCKETS;
-  const sum = registers.reduce((total, rank) => total + 2 ** -rank, 0);
+  let sum = 0;
+  for (const rank of registers) {
+    sum += rank === null ? 1 : 2 ** -rank;
+  }
   const raw = alpha(m) * m * m / sum;
-  const zeros = registers.filter((rank) => rank === 0).length;
+  const zeros = registers.filter((rank) => rank === null).length;
   if (raw <= 2.5 * m && zeros > 0) {
     return m * Math.log(m / zeros);
   }
   return raw;
 }
 
-function bucketsToRegisters(buckets: Array<StoredObservation | null>): number[] {
-  const registers = Array.from({ length: HLL_BUCKETS }, () => 0);
+function bucketsToRegisters(buckets: Array<StoredObservation | null>): Array<number | null> {
+  const registers = new Array<number | null>(HLL_BUCKETS).fill(null);
   for (const observation of buckets) {
     if (observation === null) {
       continue;
@@ -1029,11 +1032,11 @@ async function totalHllEstimate(env: Env): Promise<number> {
   const rows = await env.DB.prepare(
     "SELECT program_hash, observation_hash FROM hll_buckets ORDER BY program_hash ASC",
   ).all<{ program_hash: string; observation_hash: string }>();
-  const registersByProgram = new Map<string, number[]>();
+  const registersByProgram = new Map<string, Array<number | null>>();
   for (const row of rows.results) {
     let registers = registersByProgram.get(row.program_hash);
-    if (!registers) {
-      registers = Array.from({ length: HLL_BUCKETS }, () => 0);
+    if (registers === undefined) {
+      registers = new Array<number | null>(HLL_BUCKETS).fill(null);
       registersByProgram.set(row.program_hash, registers);
     }
     const bucket = observationBucket(row.observation_hash);
