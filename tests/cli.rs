@@ -72,6 +72,29 @@ fn associated_echo_wasm() -> Vec<u8> {
     .expect("valid wat")
 }
 
+fn stderr_wasm() -> Vec<u8> {
+    wat::parse_str(
+        r#"
+        (module
+          (import "wasi_snapshot_preview1" "fd_read"
+            (func $fd_read (param i32 i32 i32 i32) (result i32)))
+          (import "wasi_snapshot_preview1" "fd_write"
+            (func $fd_write (param i32 i32 i32 i32) (result i32)))
+          (memory (export "memory") 1)
+          (func (export "_start")
+            (i32.store (i32.const 0) (i32.const 16))
+            (i32.store (i32.const 4) (i32.const 64))
+            (drop (call $fd_read
+              (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 84)))
+            (i32.store (i32.const 8) (i32.const 16))
+            (i32.store (i32.const 12) (i32.load (i32.const 84)))
+            (drop (call $fd_write
+              (i32.const 2) (i32.const 8) (i32.const 1) (i32.const 88)))))
+        "#,
+    )
+    .expect("valid wat")
+}
+
 #[test]
 fn run_stats_and_list_persist_hll() {
     let temp = tempdir().expect("tempdir");
@@ -516,6 +539,72 @@ fn submit_uploads_proof_only() {
             .as_str()
             .is_some_and(|hash| hash.len() == 64)
     );
+}
+
+#[test]
+fn run_submit_uploads_bug_seeds_and_continues() {
+    let _guard = HTTP_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let temp = tempdir().expect("tempdir");
+    let wasm_path = temp.path().join("stderr.wasm");
+    let store_path = temp.path().join("store");
+    let wasm = stderr_wasm();
+    fs::write(&wasm_path, &wasm).expect("write wasm");
+
+    let (server, api_url) = test_server();
+    let expected_hash = blake3::hash(&wasm).to_hex().to_string();
+    let (tx, rx) = mpsc::channel();
+    let server_thread = thread::spawn(move || {
+        for _ in 0..2 {
+            let mut request = server.recv().expect("request");
+            let mut body = Vec::new();
+            std::io::Read::read_to_end(request.as_reader(), &mut body).expect("body");
+            tx.send((
+                request.method().as_str().to_owned(),
+                request.url().to_owned(),
+                body,
+            ))
+            .expect("send request");
+            request
+                .respond(tiny_http::Response::from_string("{}").with_header(json_header()))
+                .expect("respond");
+        }
+    });
+
+    let run = Command::new(env!("CARGO_BIN_EXE_fuzzforge"))
+        .args([
+            "run",
+            wasm_path.to_str().unwrap(),
+            "--store",
+            store_path.to_str().unwrap(),
+            "--count=2",
+            "--submit-url",
+            &api_url,
+        ])
+        .output()
+        .expect("run command");
+    assert!(run.status.success(), "stderr: {}", stderr(&run));
+    assert_eq!(stderr(&run).matches("bug_seed=").count(), 2);
+
+    let requests = [
+        rx.recv().expect("first request"),
+        rx.recv().expect("second request"),
+    ];
+    server_thread.join().expect("server thread");
+
+    for request in requests {
+        assert_eq!(request.0, "POST");
+        assert_eq!(request.1, format!("/api/programs/{expected_hash}/bugs"));
+        let bug: serde_json::Value = serde_json::from_slice(&request.2).expect("bug json");
+        assert_eq!(bug["verifier_version"], 1);
+        assert!(
+            bug["seed_hex"]
+                .as_str()
+                .is_some_and(|seed| seed.len() == 64)
+        );
+        assert!(bug.get("observation_hash").is_none());
+    }
 }
 
 #[test]

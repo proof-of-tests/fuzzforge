@@ -8,7 +8,7 @@ use fuzzforge::{
 use reqwest::blocking::Client;
 use serde::Deserialize;
 
-use crate::api::{ensure_success_ref, submit_proof_record};
+use crate::api::{ensure_success_ref, submit_bug_seed_record, submit_proof_record};
 
 pub(crate) const DEFAULT_CORPUS_FUEL_BUDGET: u64 = 10_000_000_000;
 const PROGRAM_LIST_PAGE_SIZE: usize = 100;
@@ -169,6 +169,7 @@ fn run_corpus_program(
     let mut fuel_spent = 0u64;
     let mut uploaded_observations = 0u64;
     let mut skipped_observations = 0u64;
+    let mut uploaded_bug_seeds = 0u64;
     eprintln!(
         "program_start={} repository={} fuel_budget={} initial_estimate={:.3}",
         download.program.program_hash,
@@ -181,6 +182,17 @@ fn run_corpus_program(
             .run(generate_seed(DEFAULT_SEED_BYTES)?)
             .with_context(|| format!("failed to run {}", download.program.program_hash))?;
         fuel_spent = fuel_spent.saturating_add(result.fuel_consumed);
+        if result.bug_found {
+            submit_bug_seed_record(client, api_url, session.program_hash(), &result.seed_hex)?;
+            uploaded_bug_seeds = uploaded_bug_seeds.saturating_add(1);
+            eprintln!(
+                "bug_seed={} seed={} stderr_bytes={}",
+                session.program_hash(),
+                result.seed_hex,
+                result.stderr.len()
+            );
+            continue;
+        }
         let proof = single_observation_record(
             session.program_hash(),
             result.seed_hex.clone(),
@@ -201,11 +213,12 @@ fn run_corpus_program(
         }
     }
     eprintln!(
-        "program_done={} fuel_spent={} uploaded_observations={} skipped_observations={} estimated_observations={:.3}",
+        "program_done={} fuel_spent={} uploaded_observations={} skipped_observations={} uploaded_bug_seeds={} estimated_observations={:.3}",
         session.program_hash(),
         fuel_spent,
         uploaded_observations,
         skipped_observations,
+        uploaded_bug_seeds,
         session.stats().estimated_observations
     );
     Ok(())

@@ -27,28 +27,31 @@ multiple runs with different generated seeds. `--seed` is accepted only when
 `--count=1`. Captured guest stdout is hashed into the observation hash, but is
 not persisted or forwarded to process stdout. The command prints the previous
 HLL estimate as `proven_before=<estimate>`, then updates
-`proven_added=<estimate>` after each HLL sketch update. When stderr is a
-terminal, the progress line includes a spinner while a run is executing.
+`proven_added=<estimate>` after each HLL sketch update. Guest writes to stderr
+are treated as bug findings; the seed is reported as `bug_seed=<hex>` and is not
+merged into the HLL proof. When stderr is a terminal, the progress line includes
+a spinner while a run is executing.
 For multi-run batches, fuzzforge keeps the compiled WASM module and HLL record
 in memory, then persists progress after `--save-fuel-interval` guest fuel has
 been consumed and once more at the end of the batch.
 
 Use `fuzzforge upload <wasm>` to upload a WASM module to the API. Use
 `--submit-url <url>` on `run` to submit the updated HLL proof after the batch
-finishes. Use `--submit-url` without a value to submit to the public FuzzForge
-API at `https://fuzzforge.lemmih.com`. You can also submit an existing local
-proof with `fuzzforge submit <wasm>`. Proof submission does not upload the WASM
-module, so upload it once before submitting proofs for a new program. If
+finishes and to submit stderr bug seeds immediately when they are found. Use
+`--submit-url` without a value to submit to the public FuzzForge API at
+`https://fuzzforge.lemmih.com`. You can also submit an existing local proof with
+`fuzzforge submit <wasm>`. Proof and bug-seed submission do not upload the WASM
+module, so upload it once before submitting results for a new program. If
 `--api-url` is omitted for network commands, fuzzforge reads `FUZZFORGE_API_URL`
-and otherwise defaults to `https://fuzzforge.lemmih.com`. Submitted proofs must
-use the current verifier version settings. Version 1 uses the default `fuel`,
-`memory_bytes`, and `_start` invocation.
+and otherwise defaults to `https://fuzzforge.lemmih.com`. Submitted proofs and
+bug seeds must use the current verifier version settings. Version 1 uses the
+default `fuel`, `memory_bytes`, and `_start` invocation.
 
 Use `fuzzforge corpus` to continuously fetch repository-associated WASM modules
 from the API, download each module, fetch the central proof as the initial HLL
 state, spend `10_000_000_000` guest fuel on each program using generated seeds,
-upload each new proof entry as soon as it is found, and then start the corpus
-again. The command only runs modules whose metadata reports a
+upload each new proof entry or stderr bug seed as soon as it is found, and then
+start the corpus again. The command only runs modules whose metadata reports a
 `github_repository`. Downloaded modules are cached under the user cache
 directory. Use `--fuel-budget <fuel>` to override the per-program fuel budget.
 
@@ -107,8 +110,8 @@ The runner supports a strict WASI preview1 subset:
 - stdio fd metadata
 - deterministic `proc_exit`
 
-Modules importing clocks, randomness, filesystem, network, stderr-only behavior,
-or unsupported WASI APIs are rejected before execution.
+Modules importing clocks, randomness, filesystem, network, or unsupported WASI
+APIs are rejected before execution.
 
 ## HLL Storage
 
@@ -143,6 +146,7 @@ The Worker API lives in `worker/src/index.ts` and uses:
 - D1 for `GET /api/programs?associated=true` associated program discovery
 - D1 for `GET /api/programs/:program_hash` metadata
 - D1 for `POST/GET /api/programs/:program_hash/proof`
+- D1 for `POST/GET /api/programs/:program_hash/bugs`
 - GitHub App user tokens for associated WASM upload authorization
 - bounded D1 HLL bucket witnesses for `GET /api/hash-results`
 - Server-sent events for `GET /api/hash-results/stream`
@@ -162,9 +166,11 @@ with a fixed 32-byte zero seed and stores the consumed fuel as
 does not reset existing fuel samples, so later random-seed sampling can refine
 the average.
 
-Proof uploads are verified inside the Worker with a Rust/wasmi verifier compiled
-to WASM: each submitted bucket witness is rerun against the stored WASM, and
-only newly verified witnesses are merged into the server-owned HLL buckets.
+Proof and bug-seed uploads are verified inside the Worker with a Rust/wasmi
+verifier compiled to WASM. Each submitted bucket witness is rerun against the
+stored WASM, and only newly verified witnesses are merged into the server-owned
+HLL buckets. Each submitted bug seed is rerun against the stored WASM, and is
+stored only when the guest writes to stderr for that seed.
 
 D1 stores one program metadata row per uploaded WASM and at most `2^6 = 64` HLL
 bucket witness rows per program. WASM bytes live in R2 at the deterministic
@@ -173,7 +179,8 @@ observation hash; runtime settings are determined by the verifier version, not
 by submitters. Concurrent proof submissions update bucket rows with SQL upserts
 that keep the smallest verified observation hash for that bucket, which is
 equivalent to the highest HLL rank. The rank is derived when a proof is read; it
-is not stored. The live counter is derived by summing current HLL estimates.
+is not stored. D1 also stores at most 100 verified stderr bug seeds per program.
+The live counter is derived by summing current HLL estimates.
 
 Create the Cloudflare resources once:
 

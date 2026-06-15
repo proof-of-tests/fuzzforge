@@ -5,6 +5,10 @@ const PROGRAM_HASH = "a2840b47184016de26d91be9d95955d962509723404cf60907961399cc
 const WASM_HEX =
   "0061736d0100000001040160000003020100070a01065f737461727400000a040102000b";
 const WASM = hexToBytes(WASM_HEX);
+const BUG_PROGRAM_HASH = "7fdd19f01c32b0b157ac9712e51dd424d33db5b84b36aeaad971457ff82a5261";
+const BUG_WASM_HEX =
+  "0061736d01000000010c0260047f7f7f7f017f60000002440216776173695f736e617073686f745f70726576696577310766645f72656164000016776173695f736e617073686f745f70726576696577310866645f77726974650000030201010503010001071302066d656d6f72790200065f737461727400020a440142004100411036020041044101360200410041004101411810001a411828020041004b044041084110360200410c4118280200360200410241084101411c10011a0b0b";
+const BUG_WASM = hexToBytes(BUG_WASM_HEX);
 const ASSOCIATED_PROGRAM_HASH =
   "c0e8436f1426c3ba7ab7171ef77c462526910735ef11e091b9044b476c9fbd45";
 const ASSOCIATED_WASM_HEX =
@@ -36,9 +40,11 @@ describe("fuzzforge worker api", () => {
   });
 
   beforeEach(async () => {
+    await env.DB.prepare("DELETE FROM bug_seeds").run();
     await env.DB.prepare("DELETE FROM hll_buckets").run();
     await env.DB.prepare("DELETE FROM programs").run();
     await env.WASM_BUCKET.delete(`wasm/${PROGRAM_HASH}.wasm`);
+    await env.WASM_BUCKET.delete(`wasm/${BUG_PROGRAM_HASH}.wasm`);
     await env.WASM_BUCKET.delete(`wasm/${ASSOCIATED_PROGRAM_HASH}.wasm`);
   });
 
@@ -469,6 +475,88 @@ describe("fuzzforge worker api", () => {
     await expect(response.json()).resolves.toEqual({ error: "invalid_observation" });
   });
 
+  test("rejects malformed bug seed reports", async () => {
+    const response = await SELF.fetch(`https://example.com/api/programs/${PROGRAM_HASH}/bugs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ seed_hex: "0", verifier_version: 1 }),
+    });
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ error: "invalid_bug_seed" });
+  });
+
+  test("rejects bug seed reports for unknown wasm", async () => {
+    const response = await SELF.fetch(`https://example.com/api/programs/${PROGRAM_HASH}/bugs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ seed_hex: "01", verifier_version: 1 }),
+    });
+    expect(response.status).toBe(404);
+    await expect(response.json()).resolves.toEqual({ error: "wasm_not_found" });
+  });
+
+  test("rejects bug seed reports that do not reproduce stderr", async () => {
+    await uploadWasm();
+
+    const response = await SELF.fetch(`https://example.com/api/programs/${PROGRAM_HASH}/bugs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ seed_hex: "01", verifier_version: 1 }),
+    });
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ error: "bug_not_reproduced" });
+  });
+
+  test("stores and deduplicates verified bug seeds", async () => {
+    await uploadBugWasm();
+
+    const first = await submitBugSeed("01");
+    expect(first.status, await first.clone().text()).toBe(200);
+    await expect(first.json()).resolves.toEqual({
+      program_hash: BUG_PROGRAM_HASH,
+      stored_bug_seeds: 1,
+    });
+
+    const duplicate = await submitBugSeed("01");
+    expect(duplicate.status, await duplicate.clone().text()).toBe(200);
+    await expect(duplicate.json()).resolves.toEqual({
+      program_hash: BUG_PROGRAM_HASH,
+      stored_bug_seeds: 1,
+    });
+
+    const get = await SELF.fetch(`https://example.com/api/programs/${BUG_PROGRAM_HASH}/bugs`);
+    expect(get.status).toBe(200);
+    await expect(get.json()).resolves.toMatchObject({
+      program_hash: BUG_PROGRAM_HASH,
+      bugs: [
+        {
+          seed_hex: "01",
+          verifier_version: 1,
+          created_at: expect.any(String),
+        },
+      ],
+    });
+  });
+
+  test("keeps at most 100 bug seeds for each wasm", async () => {
+    await uploadBugWasm();
+
+    for (let value = 0; value <= 100; value += 1) {
+      const seedHex = value.toString(16).padStart(2, "0");
+      const response = await submitBugSeed(seedHex);
+      expect(response.status, await response.clone().text()).toBe(200);
+    }
+
+    const get = await SELF.fetch(`https://example.com/api/programs/${BUG_PROGRAM_HASH}/bugs`);
+    expect(get.status).toBe(200);
+    const body = (await get.json()) as {
+      bugs: Array<{ seed_hex: string; verifier_version: number; created_at: string }>;
+    };
+    expect(body.bugs).toHaveLength(100);
+    expect(body.bugs.map((bug) => bug.seed_hex)).not.toContain("00");
+    expect(body.bugs.map((bug) => bug.seed_hex)).toContain("64");
+  });
+
   test("streams live counter events after verified writes", async () => {
     await uploadWasm();
     await submitProof(proofObservation(OBSERVATIONS[0]));
@@ -551,11 +639,32 @@ async function uploadWasm() {
   return put;
 }
 
+async function uploadBugWasm() {
+  const put = await SELF.fetch(`https://example.com/api/programs/${BUG_PROGRAM_HASH}/wasm`, {
+    method: "PUT",
+    body: BUG_WASM,
+  });
+  expect(put.status, await put.clone().text()).toBe(200);
+  await expect(put.json()).resolves.toMatchObject({
+    program_hash: BUG_PROGRAM_HASH,
+    bytes: BUG_WASM.byteLength,
+  });
+  return put;
+}
+
 function submitProof(record: unknown): Promise<Response> {
   return SELF.fetch(`https://example.com/api/programs/${PROGRAM_HASH}/proof`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(record),
+  });
+}
+
+function submitBugSeed(seedHex: string): Promise<Response> {
+  return SELF.fetch(`https://example.com/api/programs/${BUG_PROGRAM_HASH}/bugs`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ seed_hex: seedHex, verifier_version: 1 }),
   });
 }
 

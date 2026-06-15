@@ -27,6 +27,7 @@ const ERR_FAULT: i32 = 21;
 const ERR_INVAL: i32 = 28;
 const FD_STDIN: i32 = 0;
 const FD_STDOUT: i32 = 1;
+const FD_STDERR: i32 = 2;
 const FILETYPE_CHARACTER_DEVICE: u8 = 2;
 const RIGHTS_FD_READ: u64 = 1 << 1;
 const RIGHTS_FD_FDSTAT_SET_FLAGS: u64 = 1 << 3;
@@ -85,6 +86,8 @@ pub struct RunResult {
     pub fuel_consumed: u64,
     pub fuel_remaining: u64,
     pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub bug_found: bool,
     pub observation_hash: String,
     pub run_count: u64,
     pub estimated_observations: f64,
@@ -664,6 +667,7 @@ impl WasmProgram {
             stdin,
             stdin_pos: 0,
             stdout: Vec::new(),
+            stderr: Vec::new(),
             limits,
         };
         let mut store = WasmiStore::new(&self.engine, state);
@@ -692,11 +696,13 @@ impl WasmProgram {
         };
         let fuel_remaining = store.get_fuel().context("failed to read remaining fuel")?;
         let stdout = std::mem::take(&mut store.data_mut().stdout);
+        let stderr = std::mem::take(&mut store.data_mut().stderr);
         Ok(ExecutionOutput {
             status,
             fuel_consumed: config.fuel.saturating_sub(fuel_remaining),
             fuel_remaining,
             stdout,
+            stderr,
         })
     }
 }
@@ -770,7 +776,9 @@ impl RunSession {
     pub fn run(&mut self, seed: Vec<u8>) -> Result<RunResult> {
         let result = run_compiled_wasm(&self.program, &mut self.record, seed, self.config.clone())?;
         self.unsaved_fuel = self.unsaved_fuel.saturating_add(result.fuel_consumed);
-        self.has_unsaved_observations = true;
+        if !result.bug_found {
+            self.has_unsaved_observations = true;
+        }
         Ok(result)
     }
 
@@ -855,7 +863,10 @@ fn run_compiled_wasm(
     };
     let stored_observation = StoredObservation::from_observation(observation);
     let observation_hash = stored_observation.observation_hash.clone();
-    record.insert_observation_into_valid_record(stored_observation)?;
+    let bug_found = !output.stderr.is_empty();
+    if !bug_found {
+        record.insert_observation_into_valid_record(stored_observation)?;
+    }
     let stats = record.stats();
     Ok(RunResult {
         program_hash,
@@ -865,6 +876,8 @@ fn run_compiled_wasm(
         fuel_consumed: output.fuel_consumed,
         fuel_remaining: output.fuel_remaining,
         stdout: output.stdout,
+        stderr: output.stderr,
+        bug_found,
         observation_hash,
         run_count: stats.run_count,
         estimated_observations: stats.estimated_observations,
@@ -970,6 +983,7 @@ struct ExecutionOutput {
     fuel_consumed: u64,
     fuel_remaining: u64,
     stdout: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -978,6 +992,7 @@ struct HostState {
     stdin: Vec<u8>,
     stdin_pos: usize,
     stdout: Vec<u8>,
+    stderr: Vec<u8>,
     limits: StoreLimits,
 }
 
@@ -1072,7 +1087,7 @@ fn fd_write(
     iovs_len: i32,
     bytes_written: i32,
 ) -> i32 {
-    if fd != FD_STDOUT {
+    if !matches!(fd, FD_STDOUT | FD_STDERR) {
         return ERR_BADF;
     }
     let Some(memory) = guest_memory(&caller) else {
@@ -1088,7 +1103,12 @@ fn fd_write(
         if memory.read(&caller, ptr, &mut bytes).is_err() {
             return ERR_FAULT;
         }
-        caller.data_mut().stdout.extend_from_slice(&bytes);
+        let state = caller.data_mut();
+        match fd {
+            FD_STDOUT => state.stdout.extend_from_slice(&bytes),
+            FD_STDERR => state.stderr.extend_from_slice(&bytes),
+            _ => unreachable!("fd was checked above"),
+        }
         total = total.saturating_add(len);
     }
     write_u32(&memory, &mut caller, bytes_written, total as u32)
@@ -1097,7 +1117,7 @@ fn fd_write(
 fn fd_fdstat_get(mut caller: Caller<'_, HostState>, fd: i32, stat_ptr: i32) -> i32 {
     let rights = match fd {
         FD_STDIN => RIGHTS_FD_READ | RIGHTS_FD_FDSTAT_SET_FLAGS,
-        FD_STDOUT => RIGHTS_FD_WRITE | RIGHTS_FD_FDSTAT_SET_FLAGS,
+        FD_STDOUT | FD_STDERR => RIGHTS_FD_WRITE | RIGHTS_FD_FDSTAT_SET_FLAGS,
         _ => return ERR_BADF,
     };
     let Some(memory) = guest_memory(&caller) else {
@@ -1721,7 +1741,7 @@ mod tests {
     }
 
     #[test]
-    fn stderr_write_gets_deterministic_badf() {
+    fn stderr_write_is_captured_as_bug_finding() {
         let wasm = wat_bytes(
             r#"
             (module
@@ -1732,15 +1752,22 @@ mod tests {
                 (i32.store (i32.const 0) (i32.const 16))
                 (i32.store (i32.const 4) (i32.const 1))
                 (i32.store8 (i32.const 16) (i32.const 120))
-                (if (i32.ne
-                    (call $fd_write (i32.const 2) (i32.const 0) (i32.const 1) (i32.const 8))
-                    (i32.const 8))
-                  (then unreachable))))
+                (drop
+                  (call $fd_write (i32.const 2) (i32.const 0) (i32.const 1) (i32.const 8)))))
             "#,
         );
-        let output = execute_wasm(&wasm, Vec::new(), RunConfig::default()).unwrap();
-        assert_eq!(output.status, RunStatus::Success);
-        assert!(output.stdout.is_empty());
+        let store = tempdir().expect("tempdir");
+        let result =
+            run_wasm_bytes(&wasm, b"seed".to_vec(), store.path(), RunConfig::default()).unwrap();
+        assert_eq!(result.status, RunStatus::Success);
+        assert!(result.stdout.is_empty());
+        assert_eq!(result.stderr, b"x");
+        assert!(result.bug_found);
+
+        let record = Store::new(store.path())
+            .load_or_new(&result.program_hash)
+            .unwrap();
+        assert_eq!(record.bucket_witnesses().count(), 0);
     }
 
     #[test]

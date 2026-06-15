@@ -21,6 +21,19 @@ interface StoredObservation {
   verifier_version: number;
 }
 
+interface StoredBugSeed {
+  seed_hex: string;
+  verifier_version: number;
+  created_at?: string;
+}
+
+interface BugSeedRow {
+  program_hash: string;
+  seed_hex: string;
+  verifier_version: number;
+  created_at: string;
+}
+
 interface BucketRow {
   program_hash: string;
   bucket_index: number;
@@ -100,12 +113,14 @@ const HLL_PRECISION = 6;
 const HLL_BUCKETS = 1 << HLL_PRECISION;
 const MAX_STREAM_INTERVAL_MS = 10_000;
 const CURRENT_VERIFIER_VERSION = 1;
+const MAX_BUG_SEEDS_PER_PROGRAM = 100;
 const VERIFY_CODES: Record<number, string> = {
   1: "invalid_verifier_input",
   2: "invalid_proof",
   3: "wasm_hash_mismatch",
   4: "observation_verification_failed",
   5: "unsupported_wasm",
+  6: "bug_not_reproduced",
   9: "observation_hash_mismatch",
 };
 
@@ -121,6 +136,14 @@ type VerifierExports = {
     wasmLen: number,
     observationPtr: number,
     observationLen: number,
+    outPtr: number,
+    outLen: number,
+  ): number;
+  ff_verify_bug(
+    wasmPtr: number,
+    wasmLen: number,
+    bugPtr: number,
+    bugLen: number,
     outPtr: number,
     outLen: number,
   ): number;
@@ -175,6 +198,14 @@ export default {
           }
           if (request.method === "GET") {
             return await getProof(env, programHash);
+          }
+        }
+        if (parts[3] === "bugs") {
+          if (request.method === "POST" || request.method === "PUT") {
+            return await putBugSeed(request, env, programHash);
+          }
+          if (request.method === "GET") {
+            return await getBugSeeds(env, programHash);
           }
         }
         if (parts[3] === "stats" && request.method === "GET") {
@@ -456,6 +487,58 @@ async function putProof(request: Request, env: Env, programHash: string): Promis
   });
 }
 
+async function putBugSeed(request: Request, env: Env, programHash: string): Promise<Response> {
+  const bugSeed = validateBugSeed(await request.json());
+  const wasmObject = await env.WASM_BUCKET.get(wasmKey(programHash));
+  if (wasmObject === null) {
+    throw new HttpError(404, "wasm_not_found");
+  }
+
+  const wasm = await wasmObject.arrayBuffer();
+  await verifyBugSeed(wasm, bugSeed);
+
+  const now = new Date().toISOString();
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT OR IGNORE INTO bug_seeds (
+        program_hash,
+        seed_hex,
+        verifier_version,
+        created_at
+      )
+       VALUES (?, ?, ?, ?)`,
+    ).bind(programHash, bugSeed.seed_hex, bugSeed.verifier_version, now),
+    env.DB.prepare(
+      `DELETE FROM bug_seeds
+       WHERE program_hash = ?
+         AND seed_hex NOT IN (
+          SELECT seed_hex
+          FROM bug_seeds
+          WHERE program_hash = ?
+          ORDER BY created_at DESC, seed_hex DESC
+          LIMIT ?
+         )`,
+    ).bind(programHash, programHash, MAX_BUG_SEEDS_PER_PROGRAM),
+  ]);
+
+  const bugs = await loadBugSeeds(env, programHash);
+  return json({
+    program_hash: programHash,
+    stored_bug_seeds: bugs.length,
+  });
+}
+
+async function getBugSeeds(env: Env, programHash: string): Promise<Response> {
+  const row = await loadProgramRow(env, programHash);
+  if (!row) {
+    throw new HttpError(404, "program_not_found");
+  }
+  return json({
+    program_hash: programHash,
+    bugs: await loadBugSeeds(env, programHash),
+  });
+}
+
 function fuelEstimateUpdateStatement(
   env: Env,
   programHash: string,
@@ -698,6 +781,23 @@ function validateProofObservation(value: unknown): StoredObservation {
   };
 }
 
+function validateBugSeed(value: unknown): StoredBugSeed {
+  if (!isRecord(value)) {
+    throw new HttpError(400, "invalid_bug_seed");
+  }
+  if (
+    typeof value.seed_hex !== "string" ||
+    !SEED_RE.test(value.seed_hex) ||
+    value.verifier_version !== CURRENT_VERIFIER_VERSION
+  ) {
+    throw new HttpError(400, "invalid_bug_seed");
+  }
+  return {
+    seed_hex: value.seed_hex,
+    verifier_version: CURRENT_VERIFIER_VERSION,
+  };
+}
+
 async function verifyGitHubRepositoryAccess(
   request: Request,
   env: Env,
@@ -928,6 +1028,44 @@ async function verifyProof(
   }
 }
 
+async function verifyBugSeed(
+  wasm: ArrayBuffer,
+  bugSeed: StoredBugSeed,
+): Promise<ProofVerificationReport> {
+  const exports = await verifierExports();
+  const wasmBytes = new Uint8Array(wasm);
+  const bugBytes = new TextEncoder().encode(JSON.stringify(bugSeed));
+  const wasmPtr = copyIntoVerifier(exports, wasmBytes);
+  const bugPtr = copyIntoVerifier(exports, bugBytes);
+  const outLen = 8;
+  const outPtr = exports.ff_alloc(outLen);
+  try {
+    const code = exports.ff_verify_bug(
+      wasmPtr,
+      wasmBytes.byteLength,
+      bugPtr,
+      bugBytes.byteLength,
+      outPtr,
+      outLen,
+    );
+    if (code !== 0) {
+      throw new HttpError(400, VERIFY_CODES[code] ?? "verifier_error");
+    }
+    const view = new DataView(exports.memory.buffer, outPtr, outLen);
+    const fuelConsumed = view.getBigUint64(0, true);
+    if (fuelConsumed > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new HttpError(400, "bug_fuel_too_large");
+    }
+    return {
+      fuel_consumed: Number(fuelConsumed),
+    };
+  } finally {
+    exports.ff_dealloc(wasmPtr, wasmBytes.byteLength);
+    exports.ff_dealloc(bugPtr, bugBytes.byteLength);
+    exports.ff_dealloc(outPtr, outLen);
+  }
+}
+
 function copyIntoVerifier(exports: VerifierExports, bytes: Uint8Array): number {
   const ptr = exports.ff_alloc(bytes.byteLength);
   new Uint8Array(exports.memory.buffer, ptr, bytes.byteLength).set(bytes);
@@ -975,6 +1113,26 @@ async function loadProof(env: Env, programHash: string): Promise<HllRecord> {
     precision: HLL_PRECISION,
     buckets,
   };
+}
+
+async function loadBugSeeds(env: Env, programHash: string): Promise<StoredBugSeed[]> {
+  const rows = await env.DB.prepare(
+    `SELECT
+      program_hash,
+      seed_hex,
+      verifier_version,
+      created_at
+     FROM bug_seeds
+     WHERE program_hash = ?
+     ORDER BY created_at DESC, seed_hex DESC`,
+  )
+    .bind(programHash)
+    .all<BugSeedRow>();
+  return rows.results.map((row) => ({
+    seed_hex: row.seed_hex,
+    verifier_version: row.verifier_version,
+    created_at: row.created_at,
+  }));
 }
 
 function observationBucket(observationHash: string): { index: number; rank: number } {

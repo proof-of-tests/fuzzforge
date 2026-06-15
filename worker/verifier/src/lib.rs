@@ -19,6 +19,7 @@ const ERR_FAULT: i32 = 21;
 const ERR_INVAL: i32 = 28;
 const FD_STDIN: i32 = 0;
 const FD_STDOUT: i32 = 1;
+const FD_STDERR: i32 = 2;
 const FILETYPE_CHARACTER_DEVICE: u8 = 2;
 const RIGHTS_FD_READ: u64 = 1 << 1;
 const RIGHTS_FD_FDSTAT_SET_FLAGS: u64 = 1 << 3;
@@ -30,6 +31,7 @@ const VERIFY_INVALID_INPUT: i32 = 1;
 const VERIFY_INVALID_RECORD: i32 = 2;
 const VERIFY_OBSERVATION_MISMATCH: i32 = 4;
 const VERIFY_UNSUPPORTED_WASM: i32 = 5;
+const VERIFY_BUG_NOT_REPRODUCED: i32 = 6;
 const VERIFY_HASH_MISMATCH: i32 = 9;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +65,12 @@ pub struct StoredObservation {
     pub observation_hash: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredBugSeed {
+    pub seed_hex: String,
+    pub verifier_version: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct BrowserRunObservation {
     seed_hex: String,
@@ -70,6 +78,7 @@ struct BrowserRunObservation {
     observation_hash: String,
     fuel_consumed: u64,
     bucket_index: usize,
+    bug_found: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +96,7 @@ struct ExecutionOutput {
     status: RunStatus,
     fuel_consumed: u64,
     stdout: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -95,6 +105,7 @@ struct HostState {
     stdin: Vec<u8>,
     stdin_pos: usize,
     stdout: Vec<u8>,
+    stderr: Vec<u8>,
     limits: StoreLimits,
 }
 
@@ -208,6 +219,30 @@ pub unsafe extern "C" fn ff_verify(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn ff_verify_bug(
+    wasm_ptr: *const u8,
+    wasm_len: usize,
+    bug_ptr: *const u8,
+    bug_len: usize,
+    out_ptr: *mut u8,
+    out_len: usize,
+) -> i32 {
+    if wasm_ptr.is_null() || bug_ptr.is_null() || out_ptr.is_null() || out_len < 8 {
+        return VERIFY_INVALID_INPUT;
+    }
+    let wasm = unsafe { slice::from_raw_parts(wasm_ptr, wasm_len) };
+    let bug_json = unsafe { slice::from_raw_parts(bug_ptr, bug_len) };
+    let out = unsafe { slice::from_raw_parts_mut(out_ptr, out_len) };
+    match verify_bug(wasm, bug_json) {
+        Ok(fuel_consumed) => {
+            out[..8].copy_from_slice(&fuel_consumed.to_le_bytes());
+            VERIFY_OK
+        }
+        Err(code) => code,
+    }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ff_program_new(wasm_ptr: *const u8, wasm_len: usize) -> usize {
     if wasm_ptr.is_null() {
         return 0;
@@ -272,6 +307,12 @@ fn verify(wasm: &[u8], observation_json: &[u8]) -> Result<u64, i32> {
     verify_observation(&program, &program.program_hash, &observation)
 }
 
+fn verify_bug(wasm: &[u8], bug_json: &[u8]) -> Result<u64, i32> {
+    let bug: StoredBugSeed = serde_json::from_slice(bug_json).map_err(|_| VERIFY_INVALID_RECORD)?;
+    let program = WasmProgram::compile(wasm).map_err(|_| VERIFY_UNSUPPORTED_WASM)?;
+    verify_bug_seed(&program, &bug)
+}
+
 fn run_browser_observation(
     program: &WasmProgram,
     seed: Vec<u8>,
@@ -297,6 +338,7 @@ fn run_browser_observation(
         observation_hash: stored.observation_hash,
         fuel_consumed: output.fuel_consumed,
         bucket_index,
+        bug_found: !output.stderr.is_empty(),
     })
 }
 
@@ -376,6 +418,7 @@ impl WasmProgram {
             stdin,
             stdin_pos: 0,
             stdout: Vec::new(),
+            stderr: Vec::new(),
             limits,
         };
         let mut store = WasmiStore::new(&self.engine, state);
@@ -404,10 +447,12 @@ impl WasmProgram {
         };
         let fuel_remaining = store.get_fuel().map_err(|_| ())?;
         let stdout = std::mem::take(&mut store.data_mut().stdout);
+        let stderr = std::mem::take(&mut store.data_mut().stderr);
         Ok(ExecutionOutput {
             status,
             fuel_consumed: config.fuel.saturating_sub(fuel_remaining),
             stdout,
+            stderr,
         })
     }
 }
@@ -436,6 +481,21 @@ fn verify_observation(
     });
     if actual.observation_hash != expected.observation_hash {
         return Err(VERIFY_HASH_MISMATCH);
+    }
+    Ok(output.fuel_consumed)
+}
+
+fn verify_bug_seed(program: &WasmProgram, expected: &StoredBugSeed) -> Result<u64, i32> {
+    let seed = seed_from_hex(&expected.seed_hex).ok_or(VERIFY_INVALID_RECORD)?;
+    if !SUPPORTED_VERIFIER_VERSIONS.contains(&expected.verifier_version) {
+        return Err(VERIFY_INVALID_RECORD);
+    }
+    let config = verifier_version_config(expected.verifier_version);
+    let output = program
+        .execute(seed, config)
+        .map_err(|_| VERIFY_OBSERVATION_MISMATCH)?;
+    if output.stderr.is_empty() {
+        return Err(VERIFY_BUG_NOT_REPRODUCED);
     }
     Ok(output.fuel_consumed)
 }
@@ -564,7 +624,7 @@ fn fd_write(
     iovs_len: i32,
     bytes_written: i32,
 ) -> i32 {
-    if fd != FD_STDOUT {
+    if !matches!(fd, FD_STDOUT | FD_STDERR) {
         return ERR_BADF;
     }
     let Some(memory) = guest_memory(&caller) else {
@@ -580,7 +640,12 @@ fn fd_write(
         if memory.read(&caller, ptr, &mut bytes).is_err() {
             return ERR_FAULT;
         }
-        caller.data_mut().stdout.extend_from_slice(&bytes);
+        let state = caller.data_mut();
+        match fd {
+            FD_STDOUT => state.stdout.extend_from_slice(&bytes),
+            FD_STDERR => state.stderr.extend_from_slice(&bytes),
+            _ => unreachable!("fd was checked above"),
+        }
         total = total.saturating_add(len);
     }
     write_u32(&memory, &mut caller, bytes_written, total as u32)
@@ -589,7 +654,7 @@ fn fd_write(
 fn fd_fdstat_get(mut caller: Caller<'_, HostState>, fd: i32, stat_ptr: i32) -> i32 {
     let rights = match fd {
         FD_STDIN => RIGHTS_FD_READ | RIGHTS_FD_FDSTAT_SET_FLAGS,
-        FD_STDOUT => RIGHTS_FD_WRITE | RIGHTS_FD_FDSTAT_SET_FLAGS,
+        FD_STDOUT | FD_STDERR => RIGHTS_FD_WRITE | RIGHTS_FD_FDSTAT_SET_FLAGS,
         _ => return ERR_BADF,
     };
     let Some(memory) = guest_memory(&caller) else {

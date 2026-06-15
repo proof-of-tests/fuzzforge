@@ -17,7 +17,7 @@ use fuzzforge::{
 };
 
 use crate::{
-    api::{api_url_or_env, github_auth_login, submit_proof, upload_wasm},
+    api::{api_url_or_env, github_auth_login, submit_bug_seed, submit_proof, upload_wasm},
     cli::{AuthCommand, Cli, Command},
     corpus::run_corpus,
     progress::ProgressDisplay,
@@ -87,6 +87,8 @@ fn main() -> Result<()> {
                 .with_context(|| format!("failed to prepare {}", wasm.display()))?;
             let proven_before = session.stats().estimated_observations;
             let mut progress = ProgressDisplay::start(proven_before, io::stderr().is_terminal());
+            let submit_url_ref = submit_url.as_deref();
+            let submit_timeout = Duration::from_secs(submit_timeout_seconds);
 
             for _ in 0..count {
                 let seed = match explicit_seed.as_ref() {
@@ -101,6 +103,21 @@ fn main() -> Result<()> {
                     .with_context(|| {
                         format!("failed to save HLL record for {}", session.program_hash())
                     })?;
+                if result.bug_found {
+                    eprintln!(
+                        "bug_seed={} stderr_bytes={}",
+                        result.seed_hex,
+                        result.stderr.len()
+                    );
+                    if let Some(api_url) = submit_url_ref {
+                        submit_bug_seed(
+                            api_url,
+                            &result.program_hash,
+                            &result.seed_hex,
+                            submit_timeout,
+                        )?;
+                    }
+                }
                 progress.update(result.estimated_observations)?;
             }
 
@@ -109,12 +126,10 @@ fn main() -> Result<()> {
             })?;
             progress.finish()?;
 
-            if let Some(api_url) = submit_url {
-                submit_proof(
-                    &api_url,
-                    session.record(),
-                    Duration::from_secs(submit_timeout_seconds),
-                )?;
+            if let Some(api_url) = submit_url.as_deref() {
+                if session.record().bucket_witnesses().next().is_some() {
+                    submit_proof(api_url, session.record(), submit_timeout)?;
+                }
             }
         }
         Command::Stats {

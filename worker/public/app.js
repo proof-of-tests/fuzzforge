@@ -375,7 +375,11 @@ async function runProgram(program) {
       const seed = new Uint8Array(SEED_BYTES);
       crypto.getRandomValues(seed);
       const observation = verifier.runProgram(programPtr, seed);
-      if (improvesLocalBucket(program.program_hash, observation)) {
+      if (observation.bug_found) {
+        await submitBugSeed(program.program_hash, observation);
+        state.submitted += 1;
+        render();
+      } else if (improvesLocalBucket(program.program_hash, observation)) {
         await submitObservation(program.program_hash, observation);
         state.submitted += 1;
         render();
@@ -399,6 +403,20 @@ async function submitObservation(programHash, observation) {
   });
   if (!response.ok) {
     throw new Error(`proof submission failed: ${response.status}`);
+  }
+}
+
+async function submitBugSeed(programHash, observation) {
+  const response = await fetch(`/api/programs/${programHash}/bugs`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      seed_hex: observation.seed_hex,
+      verifier_version: observation.verifier_version,
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(`bug seed submission failed: ${response.status}`);
   }
 }
 

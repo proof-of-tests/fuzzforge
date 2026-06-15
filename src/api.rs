@@ -199,6 +199,43 @@ pub(crate) fn submit_proof_record(
     Ok(())
 }
 
+pub(crate) fn submit_bug_seed(
+    api_url: &str,
+    program_hash: &str,
+    seed_hex: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let client = Client::builder()
+        .timeout(timeout)
+        .build()
+        .context("failed to build HTTP client")?;
+    submit_bug_seed_record(&client, api_url, program_hash, seed_hex)
+}
+
+pub(crate) fn submit_bug_seed_record(
+    client: &Client,
+    api_url: &str,
+    program_hash: &str,
+    seed_hex: &str,
+) -> Result<()> {
+    let bug_url = format!(
+        "{}/api/programs/{program_hash}/bugs",
+        api_url.trim_end_matches('/')
+    );
+    let bug_seed = BugSeedSubmission {
+        seed_hex,
+        verifier_version: 1,
+    };
+    let response = client
+        .post(&bug_url)
+        .json(&bug_seed)
+        .send()
+        .with_context(|| format!("failed to submit bug seed to {bug_url}"))?;
+    ensure_success(response, "bug seed submission")?;
+    println!("submitted_bug_seed={program_hash} seed={seed_hex}");
+    Ok(())
+}
+
 fn submit_observation(
     client: &Client,
     proof_url: &str,
@@ -324,4 +361,10 @@ struct GitHubTokenResponse {
 struct StoredGitHubToken {
     access_token: String,
     expires_at: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct BugSeedSubmission<'a> {
+    seed_hex: &'a str,
+    verifier_version: u32,
 }
