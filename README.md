@@ -172,8 +172,9 @@ content-hash key. Each witness stores only the verifier version, seed, and
 observation hash; runtime settings are determined by the verifier version, not
 by submitters. Concurrent proof submissions update bucket rows with SQL upserts
 that keep the smallest verified observation hash for that bucket, which is
-equivalent to the highest HLL rank. The rank is derived when a proof is read; it
-is not stored. The live counter is derived by summing current HLL estimates.
+equivalent to the highest fractional HLL rank. The rank is derived as
+`64 - log2(shifted_hash_remainder)` when a proof is read; it is not stored. The
+live counter is derived by summing current HLL estimates.
 
 Create the Cloudflare resources once:
 
